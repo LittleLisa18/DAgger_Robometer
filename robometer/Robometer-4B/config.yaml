@@ -1,0 +1,187 @@
+custom_eval:
+  comparisons_per_task: 5
+  confusion_matrix:
+  - mw
+  custom_eval_random_seed: 42
+  eval_types:
+  - reward_alignment
+  - policy_ranking
+  num_examples_per_quality_pr: 5
+  num_partial_successes: 5
+  pad_frames: true
+  policy_ranking:
+  - rbm-1m-ood
+  policy_ranking_max_tasks: 100
+  quality_preference:
+  - mw
+  reward_alignment:
+  - rbm-1m-id
+  - rbm-1m-ood
+  reward_alignment_max_trajectories: 10
+  subsample_n_frames: null
+  use_frame_steps: true
+data:
+  data_source_weights:
+    metaworld_train: 1.0
+    molmoact_dataset_household: 1.0
+    molmoact_dataset_tabletop: 1.0
+    oxe_droid: 1.0
+    roboarena: 1.0
+  dataloader_num_workers: 8
+  dataloader_persistent_workers: true
+  dataloader_pin_memory: true
+  dataset_preference_ratio: 0.7
+  dataset_success_cutoff_file: robometer/data/dataset_success_cutoff.txt
+  dataset_type: strategy_first
+  eval_datasets:
+  - mw
+  eval_subset_size: null
+  load_embeddings: false
+  max_frames: 8
+  max_frames_after_preprocessing: 64
+  max_success: 1.0
+  max_trajectories: -1
+  min_frames_per_trajectory: 5
+  min_success: 0.5
+  partial_success_threshold: 0.2
+  predict_last_frame_partial_progress: false
+  preference_strategy_ratio:
+  - 1.0
+  - 1.0
+  - 1.0
+  - 1.0
+  progress_discrete_bins: 10
+  progress_loss_type: discrete
+  progress_pred_type: absolute_wrt_total_frames
+  progress_strategy_ratio:
+  - 1.0
+  - 1.0
+  - 1.0
+  - 1.0
+  resized_height: null
+  resized_width: null
+  sample_type_ratio:
+  - 1.0
+  - 0.0
+  - 0.0
+  seed: 42
+  shuffle: true
+  shuffle_progress_frames: false
+  train_datasets:
+  - rbm-1m-id
+  traj_same_source_prob: 0.5
+  use_multi_image: true
+  use_per_frame_progress_token: true
+debug: false
+logging:
+  log_level: debug
+  log_to:
+  - wandb
+  save_best:
+    greater_is_better:
+    - true
+    - true
+    - true
+    - true
+    - true
+    hub_private: false
+    hub_save_every: 1000
+    hub_token: null
+    keep_top_k: 5
+    metric_names:
+    - eval_p_rank/kendall_last_utd_so101_clean_top
+    - eval_p_rank/kendall_last_usc_xarm
+    - eval_p_rank/kendall_last_usc_franka
+    - eval_p_rank/kendall_last_rfm_new_mit_franka_nowrist
+    - eval_p_rank/kendall_last_usc_trossen
+    save_every: 250
+    upload_to_hub: false
+  save_model: true
+  save_processor: true
+  wandb_entity: clvr
+  wandb_mode: null
+  wandb_notes: all run with prog_token per frame, qwen 4b, discrete progress, 10 bins
+  wandb_project: robometer
+loss:
+  predict_last_frame_progress: false
+  progress_discrete_bins: 10
+  progress_loss_type: discrete
+  success_positive_weight: 1.0
+mode: train
+model:
+  average_temporal_patches: true
+  base_model_id: Qwen/Qwen3-VL-4B-Instruct
+  frame_pooling: mean
+  frame_pooling_attn_temperature: 1.0
+  model_type: default
+  peft_vision_encoder: false
+  progress_discrete_bins: 10
+  progress_loss_type: discrete
+  quantization: false
+  rewind: null
+  torch_dtype: bfloat16
+  train_language_model: true
+  train_preference_head: true
+  train_progress_head: true
+  train_success_head: true
+  train_vision_encoder: false
+  trust_remote_code: true
+  use_multi_image: true
+  use_peft: false
+  use_per_frame_progress_token: true
+  use_unsloth: true
+peft:
+  bias: none
+  lora_alpha: 64
+  lora_dropout: 0.05
+  peft_vision_encoder: false
+  r: 32
+  target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - gate_proj
+  - up_proj
+  - down_proj
+trainer_cls: rbm_heads
+training:
+  beta: 0.1
+  bf16: true
+  custom_eval_steps: 250
+  dataloader_num_workers: 8
+  dataloader_persistent_workers: true
+  dataloader_pin_memory: true
+  ddp_bucket_cap_mb: 25
+  ddp_find_unused_parameters: false
+  do_eval: true
+  eval_steps: 250
+  evaluation_strategy: steps
+  exp_name: ant_rfm_qwen4b_4gpu_bs16_pref_prog_succ_8_frames_all_discrete_10_bins_part2
+  fp16: false
+  gradient_accumulation_steps: 1
+  gradient_checkpointing: true
+  learning_rate: 2.0e-05
+  logging_steps: 1
+  lr_scheduler_type: cosine
+  max_grad_norm: 10.0
+  max_seq_length: 1024
+  max_steps: 15000
+  num_gpus: 2
+  num_train_epochs: -1
+  output_dir: ./logs
+  overwrite_output_dir: true
+  per_device_eval_batch_size: 16
+  per_device_train_batch_size: 16
+  predict_pref_progress: true
+  prediction_loss_only: true
+  remove_unused_columns: false
+  resume_from_checkpoint: /gpfs/home/jessezha/scrubbed_storage/reward_fm/logs/ant_rfm_qwen4b_4gpu_bs16_pref_prog_succ_8_frames_all_discrete_10_bins/ckpt-avg-5metrics=0.6973_step=3000
+  run_default_eval: false
+  save_steps: 200
+  save_strategy: 'no'
+  vision_encoder_lr: 5.0e-06
+  vision_encoder_num_layers: 3
+  warmup_ratio: 0.1
+  warmup_steps: 0
+  weight_decay: 0.01
