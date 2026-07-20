@@ -73,6 +73,13 @@ success probability, live history curves, model latency/status, policy request c
 and dropped stale monitor-job count. Colors and the three Robometer metrics follow
 `robometer/scripts/visualize_robometer_video.py`.
 
+The Piper `OpenpiClient` also sends an independent dashboard preview from the original
+top-camera frame. It uses 640x480 JPEG at quality 90 and is rate-limited to 5 FPS.
+The sender has a one-frame queue, a short timeout, and silently drops preview frames
+when the dashboard is slow or unavailable, so it cannot block policy inference. Set
+`dashboard_port=None` when constructing `OpenpiClient` to disable this preview. The
+normal 224x224 OpenPI and Robometer inputs are unchanged.
+
 Click **Reset episode** before a new rollout. A changed prompt also starts a new
 timeline automatically. A custom client may alternatively send
 `"robometer_reset": true` in its first observation; this key is removed before the

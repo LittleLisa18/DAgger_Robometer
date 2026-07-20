@@ -190,6 +190,8 @@ class LiveState:
         self.lock = threading.Lock()
         self.frames: list[np.ndarray] = []
         self.latest_jpeg: bytes | None = None
+        self.latest_preview_jpeg: bytes | None = None
+        self.latest_preview_at = 0.0
         self.task = settings.prompt or ""
         self.started_at = time.time()
         self.last_submit = 0.0
@@ -216,6 +218,11 @@ class LiveState:
             self.error = None
             if task is not None:
                 self.task = task
+
+    def set_preview(self, image: bytes) -> None:
+        with self.lock:
+            self.latest_preview_jpeg = image
+            self.latest_preview_at = time.monotonic()
 
     def observe(self, observation: dict[str, Any]) -> None:
         task = str(observation.get("prompt") or self.settings.prompt or "")
@@ -313,7 +320,7 @@ DASHBOARD_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
 <div><div class="cards"><div class="panel">Progress<div id="progress" class="value blue">—</div></div><div class="panel">Success<div id="binary" class="value green">—</div></div><div class="panel">Probability<div id="prob" class="value purple">—</div></div></div>
 <div class="panel">Task Progress<canvas id="pchart"></canvas></div><div class="panel">Success / Probability<canvas id="schart"></canvas></div></div></div></main>
 <script>function chart(id,a,b){const c=document.getElementById(id),d=devicePixelRatio||1,w=c.clientWidth,h=c.clientHeight;c.width=w*d;c.height=h*d;const x=c.getContext('2d');x.scale(d,d);x.strokeStyle='#3e4654';x.lineWidth=1;for(let i=0;i<3;i++){let y=12+i*(h-24)/2;x.beginPath();x.moveTo(35,y);x.lineTo(w-8,y);x.stroke()}function line(v,color,step){if(!v.length)return;x.strokeStyle=color;x.lineWidth=3;x.beginPath();v.forEach((q,i)=>{let xx=35+i*(w-45)/Math.max(1,v.length-1),yy=h-12-Math.max(0,Math.min(1,q))*(h-24);if(!i)x.moveTo(xx,yy);else if(step){x.lineTo(xx,py);x.lineTo(xx,yy)}else x.lineTo(xx,yy);py=yy});x.stroke()}let py=0;line(a,'#53beff',false);line(b,'#da86ff',false)}
-async function update(){try{let s=await(await fetch('/api/state',{cache:'no-store'})).json(),a=s.samples,p=a.map(x=>x.progress),q=a.map(x=>x.success_probability),b=a.map(x=>x.success);document.getElementById('task').textContent='Episode '+s.episode+' — '+(s.task||'No prompt');document.getElementById('meta').textContent=s.status+' | policy requests '+s.policy_requests+' | dropped monitor jobs '+s.dropped_monitor_jobs+' | '+s.log_path;document.getElementById('error').textContent=s.error||'';if(a.length){let z=a[a.length-1];document.getElementById('progress').textContent=z.progress.toFixed(3);document.getElementById('prob').textContent=z.success_probability.toFixed(3);document.getElementById('binary').textContent=z.success?'YES':'NO'}chart('pchart',p,[]);chart('schart',b,q);document.getElementById('camera').src='/frame.jpg?t='+Date.now()}catch(e){document.getElementById('error').textContent=e}}async function resetEpisode(){await fetch('/api/reset',{method:'POST'});update()}setInterval(update,500);update();</script></body></html>"""
+async function update(){try{let s=await(await fetch('/api/state',{cache:'no-store'})).json(),a=s.samples,p=a.map(x=>x.progress),q=a.map(x=>x.success_probability),b=a.map(x=>x.success);document.getElementById('task').textContent='Episode '+s.episode+' — '+(s.task||'No prompt');document.getElementById('meta').textContent=s.status+' | policy requests '+s.policy_requests+' | dropped monitor jobs '+s.dropped_monitor_jobs+' | '+s.log_path;document.getElementById('error').textContent=s.error||'';if(a.length){let z=a[a.length-1];document.getElementById('progress').textContent=z.progress.toFixed(3);document.getElementById('prob').textContent=z.success_probability.toFixed(3);document.getElementById('binary').textContent=z.success?'YES':'NO'}chart('pchart',p,[]);chart('schart',b,q);document.getElementById('camera').src='/frame.jpg?t='+Date.now()}catch(e){document.getElementById('error').textContent=e}}async function resetEpisode(){await fetch('/api/reset',{method:'POST'});update()}setInterval(update,200);update();</script></body></html>"""
 
 
 def dashboard_handler(state: LiveState) -> type[BaseHTTPRequestHandler]:
@@ -323,7 +330,8 @@ def dashboard_handler(state: LiveState) -> type[BaseHTTPRequestHandler]:
                 self._send(json.dumps(state.snapshot(), ensure_ascii=False).encode(), "application/json")
             elif self.path.startswith("/frame.jpg"):
                 with state.lock:
-                    image = state.latest_jpeg
+                    preview_is_live = time.monotonic() - state.latest_preview_at < 2.0
+                    image = state.latest_preview_jpeg if preview_is_live else state.latest_jpeg
                 if image is None:
                     self.send_error(404, "No camera frame yet")
                 else:
@@ -336,6 +344,17 @@ def dashboard_handler(state: LiveState) -> type[BaseHTTPRequestHandler]:
         def do_POST(self) -> None:
             if self.path == "/api/reset":
                 state.reset()
+                self._send(b'{"ok":true}', "application/json")
+            elif self.path == "/api/preview":
+                content_type = self.headers.get("Content-Type", "").split(";", 1)[0]
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                except ValueError:
+                    length = 0
+                if content_type != "image/jpeg" or not 0 < length <= 2_000_000:
+                    self.send_error(400, "Expected a JPEG no larger than 2 MB")
+                    return
+                state.set_preview(self.rfile.read(length))
                 self._send(b'{"ok":true}', "application/json")
             else:
                 self.send_error(404)
