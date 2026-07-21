@@ -5,6 +5,7 @@ XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/server_policy_with_robometer.p
     --robometer-url http://127.0.0.1:8002 \
     --dashboard-port 8080 \
     --camera cam_high \
+    --failure-timeout 5 \
     --max-frames 8 \
     --monitor-interval 1.0
 
