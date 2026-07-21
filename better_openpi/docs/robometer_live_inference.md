@@ -49,6 +49,10 @@ directory containing `params/` and `assets/`, not to `params/` itself.
 
 If Robometer is on another machine, set `--robometer-url http://<reward-server-ip>:8001`.
 
+To enable failure highlighting when progress does not increase, add (for example)
+`--failure-timeout 5`. If omitted, the feature is disabled. Progress changes of
+0.05 or less are treated as model jitter rather than an increase.
+
 ## 3. Connect the robot and view the dashboard
 
 The existing robot client needs no protocol change:
@@ -80,7 +84,8 @@ when the dashboard is slow or unavailable, so it cannot block policy inference. 
 `dashboard_port=None` when constructing `OpenpiClient` to disable this preview. The
 normal 224x224 OpenPI and Robometer inputs are unchanged.
 
-Click **Reset episode** before a new rollout. A changed prompt also starts a new
+Pressing `r` in the Piper inference reset menu resets this timeline automatically.
+Click **Reset episode** when using another client. A changed prompt also starts a new
 timeline automatically. A custom client may alternatively send
 `"robometer_reset": true` in its first observation; this key is removed before the
 observation reaches OpenPI.

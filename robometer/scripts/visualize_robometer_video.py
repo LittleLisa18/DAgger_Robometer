@@ -32,6 +32,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--title", default="Dishcloth Folding — Robometer Timeline")
     parser.add_argument("--inference-fps", type=float, default=3.0)
     parser.add_argument("--success-threshold", type=float, default=0.5)
+    parser.add_argument("--failure-timeout", type=float, default=None, metavar="SECONDS")
+    parser.add_argument("--progress-increase-epsilon", type=float, default=0.05)
     parser.add_argument("--width", type=int, default=1920)
     parser.add_argument("--height", type=int, default=1080)
     parser.add_argument("--codec", default="mp4v")
@@ -129,6 +131,10 @@ def main() -> None:
     args = parse_args()
     if args.inference_fps <= 0:
         raise ValueError("--inference-fps must be positive")
+    if args.failure_timeout is not None and args.failure_timeout <= 0:
+        raise ValueError("--failure-timeout must be positive")
+    if args.progress_increase_epsilon < 0:
+        raise ValueError("--progress-increase-epsilon must be non-negative")
     if len(args.codec) != 4:
         raise ValueError("--codec must contain four characters")
 
@@ -138,6 +144,17 @@ def main() -> None:
     output_path = Path(args.output).expanduser().resolve()
     progress, probability = load_results(results_dir, video_path.stem)
     binary = (probability >= args.success_threshold).astype(np.float32)
+
+    failure_by_sample = np.zeros(len(progress), dtype=bool)
+    if args.failure_timeout is not None:
+        best_progress = float(progress[0])
+        last_increase_time = 0.0
+        for index, value in enumerate(progress):
+            sample_time = index / args.inference_fps
+            if float(value) > best_progress + args.progress_increase_epsilon:
+                best_progress = float(value)
+                last_increase_time = sample_time
+            failure_by_sample[index] = sample_time - last_increase_time >= args.failure_timeout
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -188,7 +205,14 @@ def main() -> None:
 
             shown, vx, vy = fit_frame(frame, video_box)
             canvas[vy:vy + shown.shape[0], vx:vx + shown.shape[1]] = shown
-            cv2.rectangle(canvas, (vx, vy), (vx + shown.shape[1], vy + shown.shape[0]), (82, 91, 106), 2)
+            visible_count = int(np.searchsorted(sample_indices, frame_index, side="right"))
+            failed = visible_count > 0 and failure_by_sample[visible_count - 1]
+            border_color = (69, 69, 255) if failed else (82, 91, 106)
+            border_width = 10 if failed else 2
+            cv2.rectangle(canvas, (vx, vy), (vx + shown.shape[1], vy + shown.shape[0]), border_color, border_width)
+            if failed:
+                cv2.rectangle(canvas, (vx + 14, vy + 67), (vx + 245, vy + 112), border_color, -1)
+                put_text(canvas, "FAILURE: STALLED", (vx + 27, vy + 98), 0.67, (255, 255, 255), 2)
 
             label = labels[min(frame_index, len(labels) - 1)].strip().lower()
             label_color = DAGGER if label == "dagger" else ROLLOUT
@@ -201,7 +225,6 @@ def main() -> None:
             time_text = f"{elapsed:06.2f}s / {duration:06.2f}s"
             put_text(canvas, time_text, (vx + shown.shape[1] - 245, vy + 43), 0.65, TEXT, 2)
 
-            visible_count = int(np.searchsorted(sample_indices, frame_index, side="right"))
             fraction = frame_index / max(1, total_frames - 1)
             draw_chart(canvas, boxes[0], "Task Progress", progress, PROGRESS, visible_count, fraction)
             draw_chart(canvas, boxes[1], f"Success (threshold {args.success_threshold:g})", binary, SUCCESS, visible_count, fraction, True)

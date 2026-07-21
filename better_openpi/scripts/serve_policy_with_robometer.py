@@ -54,6 +54,7 @@ class Settings:
     monitor_interval: float
     timeout: float
     success_threshold: float
+    failure_timeout: float | None
     output_dir: Path
     use_frame_steps: bool
     record_policy: bool
@@ -74,6 +75,10 @@ def parse_args() -> Settings:
     parser.add_argument("--monitor-interval", type=float, default=1.0, help="Minimum seconds between monitor requests")
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--success-threshold", type=float, default=0.5)
+    parser.add_argument(
+        "--failure-timeout", type=float, default=None, metavar="SECONDS",
+        help="Mark the episode as failed when progress has not increased for this many seconds (disabled by default)",
+    )
     parser.add_argument("--output-dir", default="robometer_live_runs")
     parser.add_argument("--use-frame-steps", action="store_true")
     parser.add_argument("--record-policy", action="store_true")
@@ -83,6 +88,8 @@ def parse_args() -> Settings:
         parser.error("max-frames and timeout must be positive; monitor-interval must be non-negative")
     if not 0 <= args.success_threshold <= 1:
         parser.error("success-threshold must be in [0, 1]")
+    if args.failure_timeout is not None and args.failure_timeout <= 0:
+        parser.error("failure-timeout must be positive")
     return Settings(
         policy_config=args.policy_config,
         checkpoint=args.checkpoint,
@@ -96,6 +103,7 @@ def parse_args() -> Settings:
         monitor_interval=args.monitor_interval,
         timeout=args.timeout,
         success_threshold=args.success_threshold,
+        failure_timeout=args.failure_timeout,
         output_dir=Path(args.output_dir).expanduser().resolve(),
         use_frame_steps=args.use_frame_steps,
         record_policy=args.record_policy,
@@ -185,6 +193,9 @@ def _parse_result(payload: dict[str, Any]) -> tuple[float, float, list[float], l
 
 
 class LiveState:
+    # Ignore tiny prediction jitter when deciding whether progress increased.
+    PROGRESS_INCREASE_EPSILON = 0.05
+
     def __init__(self, settings: Settings):
         self.settings = settings
         self.lock = threading.Lock()
@@ -201,7 +212,9 @@ class LiveState:
         self.error: str | None = None
         self.dropped = 0
         self.policy_requests = 0
-        self.job_queue: queue.Queue[tuple[np.ndarray, str, float]] = queue.Queue(maxsize=1)
+        self.best_progress: float | None = None
+        self.last_progress_increase_at = self.started_at
+        self.job_queue: queue.Queue[tuple[np.ndarray, str, float, int]] = queue.Queue(maxsize=1)
         stamp = time.strftime("%Y%m%d_%H%M%S")
         settings.output_dir.mkdir(parents=True, exist_ok=True)
         self.log_path = settings.output_dir / f"live_{stamp}.jsonl"
@@ -214,10 +227,18 @@ class LiveState:
             self.started_at = time.time()
             self.last_submit = 0.0
             self.episode += 1
+            self.best_progress = None
+            self.last_progress_increase_at = self.started_at
             self.status = "episode reset"
             self.error = None
             if task is not None:
                 self.task = task
+            try:
+                while True:
+                    self.job_queue.get_nowait()
+                    self.job_queue.task_done()
+            except queue.Empty:
+                pass
 
     def set_preview(self, image: bytes) -> None:
         with self.lock:
@@ -237,6 +258,8 @@ class LiveState:
                 self.samples.clear()
                 self.started_at = now
                 self.episode += 1
+                self.best_progress = None
+                self.last_progress_increase_at = now
             self.task = task
             self.policy_requests += 1
             self.frames.append(frame)
@@ -248,7 +271,8 @@ class LiveState:
                 return
             snapshot = np.stack(self.frames)
             self.last_submit = now
-        job = (snapshot, task, now)
+            request_episode = self.episode
+        job = (snapshot, task, now, request_episode)
         try:
             self.job_queue.put_nowait(job)
         except queue.Full:
@@ -260,35 +284,53 @@ class LiveState:
             with self.lock:
                 self.dropped += 1
 
-    def add_result(self, progress: float, success: float, latency: float, submitted: float,
+    def add_result(self, progress: float, success: float, latency: float, submitted: float, request_episode: int,
                    progress_trace: list[float], success_trace: list[float]) -> None:
+        now = time.time()
+        clipped_progress = float(np.clip(progress, 0, 1))
+        with self.lock:
+            if request_episode != self.episode:
+                return
+            if self.best_progress is None or clipped_progress > self.best_progress + self.PROGRESS_INCREASE_EPSILON:
+                self.best_progress = clipped_progress
+                self.last_progress_increase_at = now
         item = {
-            "time": time.time(), "elapsed": time.time() - self.started_at,
+            "time": now, "elapsed": now - self.started_at,
             "source_elapsed": submitted - self.started_at,
-            "progress": float(np.clip(progress, 0, 1)),
+            "progress": clipped_progress,
             "success_probability": float(np.clip(success, 0, 1)),
             "success": int(success >= self.settings.success_threshold),
-            "latency_ms": round(latency * 1000, 1), "episode": self.episode,
+            "latency_ms": round(latency * 1000, 1), "episode": request_episode,
             "task": self.task, "progress_trace": progress_trace, "success_trace": success_trace,
         }
         with self.lock:
+            if request_episode != self.episode:
+                return
             self.samples.append(item)
             self.status = "live"
             self.error = None
         with self.log_path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(item, ensure_ascii=False) + "\n")
 
-    def fail(self, exc: Exception) -> None:
+    def fail(self, exc: Exception, request_episode: int | None = None) -> None:
         with self.lock:
+            if request_episode is not None and request_episode != self.episode:
+                return
             self.status = "Robometer unavailable"
             self.error = f"{type(exc).__name__}: {exc}"
 
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
+            failure_timeout = self.settings.failure_timeout
+            stalled_seconds = max(0.0, time.time() - self.last_progress_increase_at)
+            failure = bool(failure_timeout is not None and self.best_progress is not None
+                           and stalled_seconds >= failure_timeout)
             return {
                 "task": self.task, "episode": self.episode, "status": self.status, "error": self.error,
                 "threshold": self.settings.success_threshold, "policy_requests": self.policy_requests,
                 "dropped_monitor_jobs": self.dropped, "log_path": str(self.log_path),
+                "failure": failure, "failure_timeout": failure_timeout,
+                "progress_stalled_seconds": stalled_seconds,
                 "samples": list(self.samples),
             }
 
@@ -296,7 +338,7 @@ class LiveState:
 def monitor_worker(state: LiveState) -> None:
     endpoint = state.settings.robometer_url.rstrip("/") + "/evaluate_batch_npy"
     while True:
-        frames, task, submitted = state.job_queue.get()
+        frames, task, submitted, request_episode = state.job_queue.get()
         started = time.monotonic()
         try:
             body, content_type = _multipart(frames, task, state.settings.use_frame_steps)
@@ -304,9 +346,10 @@ def monitor_worker(state: LiveState) -> None:
             with urllib.request.urlopen(request, timeout=state.settings.timeout) as response:
                 result = json.loads(response.read())
             progress, success, progress_trace, success_trace = _parse_result(result)
-            state.add_result(progress, success, time.monotonic() - started, submitted, progress_trace, success_trace)
+            state.add_result(progress, success, time.monotonic() - started, submitted, request_episode,
+                             progress_trace, success_trace)
         except Exception as exc:
-            state.fail(exc)
+            state.fail(exc, request_episode)
             LOGGER.warning("Robometer monitoring request failed: %s", exc)
         finally:
             state.job_queue.task_done()
@@ -314,13 +357,13 @@ def monitor_worker(state: LiveState) -> None:
 
 DASHBOARD_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>OpenPI + Robometer Live</title>
-<style>body{margin:0;background:#12161e;color:#eef1f6;font:15px system-ui}main{max-width:1500px;margin:auto;padding:24px}.top{display:flex;justify-content:space-between;gap:20px;align-items:center}.muted{color:#9da6b5}.grid{display:grid;grid-template-columns:1.25fr 1fr;gap:18px}.panel{background:#1d232e;border-radius:16px;padding:18px;margin-top:18px}.camera{width:100%;max-height:570px;object-fit:contain;background:#0c1016;border-radius:10px}.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.value{font-size:32px;font-weight:700;margin-top:6px}.blue{color:#53beff}.green{color:#68d391}.purple{color:#da86ff}canvas{width:100%;height:180px}button{background:#ffb84d;border:0;border-radius:8px;padding:10px 16px;font-weight:700}#error{color:#ff8e8e;white-space:pre-wrap}@media(max-width:900px){.grid{grid-template-columns:1fr}.cards{grid-template-columns:1fr}}</style></head>
+<style>body{margin:0;background:#12161e;color:#eef1f6;font:15px system-ui}main{max-width:1500px;margin:auto;padding:24px}.top{display:flex;justify-content:space-between;gap:20px;align-items:center}.muted{color:#9da6b5}.grid{display:grid;grid-template-columns:1.25fr 1fr;gap:18px}.panel{background:#1d232e;border-radius:16px;padding:18px;margin-top:18px}.video-panel{border:4px solid transparent;transition:border-color .2s,box-shadow .2s}.video-panel.failure{border-color:#ff4545;box-shadow:0 0 24px #ff454577}.camera{width:100%;max-height:570px;object-fit:contain;background:#0c1016;border-radius:10px}.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.value{font-size:32px;font-weight:700;margin-top:6px}.blue{color:#53beff}.green{color:#68d391}.purple{color:#da86ff}canvas{width:100%;height:180px}button{background:#ffb84d;border:0;border-radius:8px;padding:10px 16px;font-weight:700}#error{color:#ff8e8e;white-space:pre-wrap}@media(max-width:900px){.grid{grid-template-columns:1fr}.cards{grid-template-columns:1fr}}</style></head>
 <body><main><div class="top"><div><h1>OpenPI + Robometer Live</h1><div id="task" class="muted"></div></div><button onclick="resetEpisode()">Reset episode</button></div>
-<div class="grid"><div class="panel"><img id="camera" class="camera" src="/frame.jpg"><div id="meta" class="muted"></div><div id="error"></div></div>
+<div class="grid"><div id="video-panel" class="panel video-panel"><img id="camera" class="camera" src="/frame.jpg"><div id="meta" class="muted"></div><div id="error"></div></div>
 <div><div class="cards"><div class="panel">Progress<div id="progress" class="value blue">—</div></div><div class="panel">Success<div id="binary" class="value green">—</div></div><div class="panel">Probability<div id="prob" class="value purple">—</div></div></div>
 <div class="panel">Task Progress<canvas id="pchart"></canvas></div><div class="panel">Success / Probability<canvas id="schart"></canvas></div></div></div></main>
 <script>function chart(id,a,b){const c=document.getElementById(id),d=devicePixelRatio||1,w=c.clientWidth,h=c.clientHeight;c.width=w*d;c.height=h*d;const x=c.getContext('2d');x.scale(d,d);x.strokeStyle='#3e4654';x.lineWidth=1;for(let i=0;i<3;i++){let y=12+i*(h-24)/2;x.beginPath();x.moveTo(35,y);x.lineTo(w-8,y);x.stroke()}function line(v,color,step){if(!v.length)return;x.strokeStyle=color;x.lineWidth=3;x.beginPath();v.forEach((q,i)=>{let xx=35+i*(w-45)/Math.max(1,v.length-1),yy=h-12-Math.max(0,Math.min(1,q))*(h-24);if(!i)x.moveTo(xx,yy);else if(step){x.lineTo(xx,py);x.lineTo(xx,yy)}else x.lineTo(xx,yy);py=yy});x.stroke()}let py=0;line(a,'#53beff',false);line(b,'#da86ff',false)}
-async function update(){try{let s=await(await fetch('/api/state',{cache:'no-store'})).json(),a=s.samples,p=a.map(x=>x.progress),q=a.map(x=>x.success_probability),b=a.map(x=>x.success);document.getElementById('task').textContent='Episode '+s.episode+' — '+(s.task||'No prompt');document.getElementById('meta').textContent=s.status+' | policy requests '+s.policy_requests+' | dropped monitor jobs '+s.dropped_monitor_jobs+' | '+s.log_path;document.getElementById('error').textContent=s.error||'';if(a.length){let z=a[a.length-1];document.getElementById('progress').textContent=z.progress.toFixed(3);document.getElementById('prob').textContent=z.success_probability.toFixed(3);document.getElementById('binary').textContent=z.success?'YES':'NO'}chart('pchart',p,[]);chart('schart',b,q);document.getElementById('camera').src='/frame.jpg?t='+Date.now()}catch(e){document.getElementById('error').textContent=e}}async function resetEpisode(){await fetch('/api/reset',{method:'POST'});update()}setInterval(update,200);update();</script></body></html>"""
+async function update(){try{let s=await(await fetch('/api/state',{cache:'no-store'})).json(),a=s.samples,p=a.map(x=>x.progress),q=a.map(x=>x.success_probability),b=a.map(x=>x.success),v=document.getElementById('video-panel');v.classList.toggle('failure',s.failure);document.getElementById('task').textContent='Episode '+s.episode+' — '+(s.task||'No prompt');let f=s.failure?' | FAILURE: progress stalled '+s.progress_stalled_seconds.toFixed(1)+'s':'';document.getElementById('meta').textContent=s.status+f+' | policy requests '+s.policy_requests+' | dropped monitor jobs '+s.dropped_monitor_jobs+' | '+s.log_path;document.getElementById('error').textContent=s.error||'';if(a.length){let z=a[a.length-1];document.getElementById('progress').textContent=z.progress.toFixed(3);document.getElementById('prob').textContent=z.success_probability.toFixed(3);document.getElementById('binary').textContent=z.success?'YES':'NO'}else{document.getElementById('progress').textContent='—';document.getElementById('prob').textContent='—';document.getElementById('binary').textContent='—'}chart('pchart',p,[]);chart('schart',b,q);document.getElementById('camera').src='/frame.jpg?t='+Date.now()}catch(e){document.getElementById('error').textContent=e}}async function resetEpisode(){await fetch('/api/reset',{method:'POST'});update()}setInterval(update,200);update();</script></body></html>"""
 
 
 def dashboard_handler(state: LiveState) -> type[BaseHTTPRequestHandler]:
