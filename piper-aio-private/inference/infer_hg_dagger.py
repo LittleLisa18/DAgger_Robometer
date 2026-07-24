@@ -105,6 +105,7 @@ class _FailurePauseMonitor:
             # published after the hold command.
             self.pause_event.set()
             try:
+                self.policy.pause_robometer()
                 with self.command_lock:
                     self.ros_operator.stop_follower_arms()
             except Exception as exc:
@@ -359,8 +360,6 @@ def model_inference(args, config, ros_operator):
                     restart_episode = False
                     while True:
                         result = handle_interactive_mode(task_time, enable_dagger=True)
-                        # Failure is edge-triggered; the operator has now chosen what to do.
-                        failure_monitor.clear_pause()
                         if result == "dagger":
                             dagger_result = run_dagger_session(args, config, ros_operator, collector, recorder)
                             if dagger_result == "shutdown":
@@ -371,6 +370,7 @@ def model_inference(args, config, ros_operator):
                             if dagger_result == "menu":
                                 continue
                         if result == "reset":
+                            failure_monitor.clear_pause()
                             episode_closed = True
                             if _reset_episode(
                                 policy,
@@ -387,6 +387,10 @@ def model_inference(args, config, ros_operator):
                         if result == "quit":
                             recorder.save_episode()
                             return
+                        if not policy.resume_robometer():
+                            raise RuntimeError("Continue aborted: live Robometer could not be resumed")
+                        # Resume failure monitoring only with model-driven arm motion.
+                        failure_monitor.clear_pause()
                         break
                     if restart_episode:
                         break

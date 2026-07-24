@@ -214,6 +214,8 @@ class LiveState:
         self.policy_requests = 0
         self.best_progress: float | None = None
         self.last_progress_increase_at = self.started_at
+        self.paused = False
+        self.failure = False
         self.job_queue: queue.Queue[tuple[np.ndarray, str, float, int]] = queue.Queue(maxsize=1)
         stamp = time.strftime("%Y%m%d_%H%M%S")
         settings.output_dir.mkdir(parents=True, exist_ok=True)
@@ -233,6 +235,8 @@ class LiveState:
             self.dropped = 0
             self.best_progress = None
             self.last_progress_increase_at = self.started_at
+            self.paused = False
+            self.failure = False
             self.status = "episode reset"
             self.error = None
             if task is not None:
@@ -244,6 +248,27 @@ class LiveState:
             except queue.Empty:
                 pass
 
+    def pause(self) -> None:
+        """Freeze Robometer at its current result until resume or reset."""
+        with self.lock:
+            self.paused = True
+            self.failure = True
+            self.status = "paused after failure"
+            try:
+                while True:
+                    self.job_queue.get_nowait()
+                    self.job_queue.task_done()
+            except queue.Empty:
+                pass
+
+    def resume(self) -> None:
+        with self.lock:
+            self.paused = False
+            self.failure = False
+            self.last_progress_increase_at = time.time()
+            self.last_submit = 0.0
+            self.status = "live" if self.samples else "waiting for observations"
+
     def set_preview(self, image: bytes) -> None:
         with self.lock:
             self.latest_preview_jpeg = image
@@ -254,9 +279,14 @@ class LiveState:
         reset = bool(observation.get("robometer_reset", False))
         if reset:
             self.reset(task)
+        with self.lock:
+            if self.paused:
+                return
         frame = _extract_frame(observation, self.settings.camera)
         now = time.time()
         with self.lock:
+            if self.paused:
+                return
             if task and self.task and task != self.task:
                 self.frames.clear()
                 self.samples.clear()
@@ -293,7 +323,7 @@ class LiveState:
         now = time.time()
         clipped_progress = float(np.clip(progress, 0, 1))
         with self.lock:
-            if request_episode != self.episode:
+            if request_episode != self.episode or self.paused:
                 return
             if self.best_progress is None or clipped_progress > self.best_progress + self.PROGRESS_INCREASE_EPSILON:
                 self.best_progress = clipped_progress
@@ -308,7 +338,7 @@ class LiveState:
             "task": self.task, "progress_trace": progress_trace, "success_trace": success_trace,
         }
         with self.lock:
-            if request_episode != self.episode:
+            if request_episode != self.episode or self.paused:
                 return
             self.samples.append(item)
             self.status = "live"
@@ -318,7 +348,7 @@ class LiveState:
 
     def fail(self, exc: Exception, request_episode: int | None = None) -> None:
         with self.lock:
-            if request_episode is not None and request_episode != self.episode:
+            if self.paused or (request_episode is not None and request_episode != self.episode):
                 return
             self.status = "Robometer unavailable"
             self.error = f"{type(exc).__name__}: {exc}"
@@ -327,13 +357,13 @@ class LiveState:
         with self.lock:
             failure_timeout = self.settings.failure_timeout
             stalled_seconds = max(0.0, time.time() - self.last_progress_increase_at)
-            failure = bool(failure_timeout is not None and self.best_progress is not None
-                           and stalled_seconds >= failure_timeout)
+            if not self.paused and failure_timeout is not None and self.best_progress is not None:
+                self.failure = stalled_seconds >= failure_timeout
             return {
                 "task": self.task, "episode": self.episode, "status": self.status, "error": self.error,
                 "threshold": self.settings.success_threshold, "policy_requests": self.policy_requests,
                 "dropped_monitor_jobs": self.dropped, "log_path": str(self.log_path),
-                "failure": failure, "failure_timeout": failure_timeout,
+                "failure": self.failure, "paused": self.paused, "failure_timeout": failure_timeout,
                 "progress_stalled_seconds": stalled_seconds,
                 "samples": list(self.samples),
             }
@@ -391,6 +421,12 @@ def dashboard_handler(state: LiveState) -> type[BaseHTTPRequestHandler]:
         def do_POST(self) -> None:
             if self.path == "/api/reset":
                 state.reset()
+                self._send(b'{"ok":true}', "application/json")
+            elif self.path == "/api/pause":
+                state.pause()
+                self._send(b'{"ok":true}', "application/json")
+            elif self.path == "/api/resume":
+                state.resume()
                 self._send(b'{"ok":true}', "application/json")
             elif self.path == "/api/preview":
                 content_type = self.headers.get("Content-Type", "").split(";", 1)[0]

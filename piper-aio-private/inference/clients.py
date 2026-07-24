@@ -103,6 +103,12 @@ class OpenpiClient:
         self.dashboard_state_url = (
             f"http://{host}:{dashboard_port}/api/state" if dashboard_port is not None else None
         )
+        self.dashboard_pause_url = (
+            f"http://{host}:{dashboard_port}/api/pause" if dashboard_port is not None else None
+        )
+        self.dashboard_resume_url = (
+            f"http://{host}:{dashboard_port}/api/resume" if dashboard_port is not None else None
+        )
         self._failure_latched = False
         self._last_failure_check = 0.0
         self.preview = (
@@ -125,6 +131,28 @@ class OpenpiClient:
             except Exception as exc:
                 print(f"Warning: failed to reset live Robometer episode ({attempt}/3): {exc}")
         return False
+
+    def pause_robometer(self) -> bool:
+        """Freeze live Robometer sampling after a detected failure."""
+        return self._set_robometer_paused(self.dashboard_pause_url, paused=True)
+
+    def resume_robometer(self) -> bool:
+        """Resume live Robometer sampling without resetting the episode."""
+        return self._set_robometer_paused(self.dashboard_resume_url, paused=False)
+
+    def _set_robometer_paused(self, url: str | None, paused: bool) -> bool:
+        if url is None:
+            return True
+        try:
+            request = urllib.request.Request(url, data=b"", method="POST")
+            with urllib.request.urlopen(request, timeout=1.0):
+                self._failure_latched = paused
+                self._last_failure_check = 0.0
+                return True
+        except Exception as exc:
+            action = "pause" if paused else "resume"
+            print(f"Warning: failed to {action} live Robometer: {exc}")
+            return False
 
     def consume_failure_event(self, min_interval: float = 0.1) -> bool:
         """Return True once when the live Robometer first detects failure."""
