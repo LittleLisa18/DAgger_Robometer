@@ -281,6 +281,18 @@ def main(
     )
     exclude_files = [
         # list of hdf5 files to exclude
+        "/media/sail/Expansion/yuxiang_rollout/pi05_vlm_fold_dishcloth_0623_dagger/episode_1.hdf5",
+        "/media/sail/Expansion/yuxiang_rollout/pi05_vlm_fold_dishcloth_0623_dagger/episode_3.hdf5",
+        "/media/sail/Expansion/yuxiang_rollout/pi05_vlm_fold_dishcloth_0623_dagger/episode_5.hdf5",
+        "/media/sail/Expansion/yuxiang_rollout/pi05_vlm_fold_dishcloth_0623_dagger/episode_9.hdf5",
+        "/media/sail/Expansion/yuxiang_rollout/pi05_vlm_fold_dishcloth_0623_dagger/episode_11.hdf5",
+        "/media/sail/Expansion/yuxiang_rollout/pi05_vlm_fold_dishcloth_0623_dagger/episode_12.hdf5",
+        "/media/sail/Expansion/yuxiang_rollout/pi05_vlm_fold_dishcloth_0623_dagger/episode_13.hdf5",
+        "/media/sail/Expansion/yuxiang_rollout/pi05_vlm_fold_dishcloth_0623_dagger/episode_14.hdf5",
+        "/media/sail/Expansion/yuxiang_rollout/pi05_vlm_fold_dishcloth_0623_dagger/episode_15.hdf5",
+        "/media/sail/Expansion/yuxiang_rollout/pi05_vlm_fold_dishcloth_0623_dagger/episode_20.hdf5",
+        "/media/sail/Expansion/yuxiang_rollout/pi05_vlm_fold_dishcloth_0623_dagger/episode_22.hdf5",
+        "/media/sail/Expansion/yuxiang_rollout/pi05_vlm_fold_dishcloth_0623_dagger/episode_37.hdf5",
     ]
 
     for repo_id in repo_ids:

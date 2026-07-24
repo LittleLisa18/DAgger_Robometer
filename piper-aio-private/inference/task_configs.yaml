@@ -96,4 +96,4 @@ fold_dishcloth:
   right0: *default_right0
   action_postprocess: 
     fix_arms_to_initial_pose: [right]
-    # fix_arms_to_initial_pose_targets: [action]
+    fix_arms_to_initial_pose_targets: [action]

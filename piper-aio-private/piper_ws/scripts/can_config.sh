@@ -93,7 +93,7 @@
 #-------------------------------------------------------------------------------------------------#
 
 # Predefined CAN module count
-EXPECTED_CAN_COUNT=2
+EXPECTED_CAN_COUNT=4
 
 if [ "$EXPECTED_CAN_COUNT" -eq 1 ]; then
     # Default CAN name, configurable through a command-line argument
@@ -111,6 +111,8 @@ if [ "$EXPECTED_CAN_COUNT" -ne 1 ]; then
     declare -A USB_PORTS 
     USB_PORTS["3-2:1.0"]="can_left:1000000"
     USB_PORTS["3-1:1.0"]="can_right:1000000"
+    USB_PORTS["1-6:1.0"]="can_left_lea:1000000"
+    USB_PORTS["1-13:1.0"]="can_right_lea:1000000"
 fi
 
 # Get the current CAN module count in the system

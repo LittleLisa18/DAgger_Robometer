@@ -1,11 +1,11 @@
-XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/server_policy_with_robometer.py \
-    --policy-config pi05_agilex \
-    --checkpoint /media/sail/jinghua4T/ckpt_yantong/pi05_fold_dishcloth_0623/49999 \
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/serve_policy_with_robometer.py \
+    --policy-config pi05_vlm_agilex \
+    --checkpoint /media/sail/jinghua4T/ckpt_yantong/pi05_vlm_fold_dishcloth_0716/49999 \
     --policy-port 8000 \
     --robometer-url http://127.0.0.1:8002 \
     --dashboard-port 8080 \
     --camera cam_high \
-    --failure-timeout 5 \
+    --failure-timeout 4 \
     --max-frames 8 \
     --monitor-interval 1.0
 
