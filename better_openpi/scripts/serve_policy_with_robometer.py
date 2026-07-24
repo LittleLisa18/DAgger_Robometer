@@ -224,9 +224,13 @@ class LiveState:
             self.frames.clear()
             self.samples.clear()
             self.latest_jpeg = None
+            self.latest_preview_jpeg = None
+            self.latest_preview_at = 0.0
             self.started_at = time.time()
             self.last_submit = 0.0
             self.episode += 1
+            self.policy_requests = 0
+            self.dropped = 0
             self.best_progress = None
             self.last_progress_increase_at = self.started_at
             self.status = "episode reset"

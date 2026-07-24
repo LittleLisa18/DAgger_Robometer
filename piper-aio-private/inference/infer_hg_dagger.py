@@ -108,6 +108,11 @@ class DaggerCollector:
         self.actions = []
         self.frame_count = 0
 
+    def reset(self):
+        """Discard all pending DAgger data for a new episode."""
+        self._reset_buffers()
+        print("DAgger collector reset")
+
     def commit_to(self, recorder):
         if not self.has_data():
             print("\033[31mNo DAgger data to commit.\033[0m")
@@ -171,9 +176,9 @@ def _record_dagger_frame(config, ros_operator, collector):
     return True
 
 
-def _restore_exit_state(ros_operator, left0, right0):
+def _restore_exit_state(ros_operator, left0, right0, move_to_initial=True):
     try:
-        if not rospy.is_shutdown():
+        if move_to_initial and not rospy.is_shutdown():
             ros_operator.move_arms_to_initial_pose(left0, right0)
         ros_operator.set_leaders_drag_teach()
     except Exception as exc:
@@ -184,16 +189,28 @@ def _restore_exit_state(ros_operator, left0, right0):
 
 
 def _wait_after_reset():
-    print("Reset complete. Press enter/c to continue, or q to quit")
+    print("Reset complete. Press ENTER to start the next episode, or q to quit")
     while not rospy.is_shutdown() and not shutdown_event.is_set():
         key = sys.stdin.read(1).lower()
-        if key in ("\n", "\r", "c"):
-            print("Continuing...")
+        if key in ("\n", "\r"):
+            print("Starting next episode...")
             return "continue"
         if key == "q":
             print("Stopping...")
             return "quit"
     return "quit"
+
+
+def _reset_episode(policy, ros_operator, collector, recorder, left0, right0):
+    """Close the current episode and reset every episode-scoped state."""
+    collector.reset()
+    reset_observation_window()
+    if not policy.reset_episode():
+        raise RuntimeError("Reset aborted: live Robometer episode could not be reset")
+    recorder.save_episode()
+    recorder.reset()
+    ros_operator.move_arms_to_initial_pose(left0, right0)
+    return _wait_after_reset()
 
 
 def run_dagger_session(args, config, ros_operator, collector, recorder):
@@ -212,7 +229,8 @@ def run_dagger_session(args, config, ros_operator, collector, recorder):
 
     try:
         while not rospy.is_shutdown() and not shutdown_event.is_set():
-            ros_operator.forward_leader_to_follower()
+            if not ros_operator.forward_leader_to_follower():
+                raise RuntimeError("DAgger stopped: leader arm data is unavailable")
             key = check_keyboard_input()
 
             if key in ("\n", "\r"):
@@ -235,7 +253,8 @@ def run_dagger_session(args, config, ros_operator, collector, recorder):
                 return "menu"
 
             if collector.is_collecting:
-                _record_dagger_frame(config, ros_operator, collector)
+                if not _record_dagger_frame(config, ros_operator, collector):
+                    raise RuntimeError("DAgger stopped: synchronized recording frame is unavailable")
             rate.sleep()
         return "shutdown"
     finally:
@@ -273,6 +292,7 @@ def model_inference(args, config, ros_operator):
     chunk_size = config["chunk_size"]
     max_publish_step = config["episode_len"]
     rate = rospy.Rate(args.publish_rate)
+    faulted = False
 
     try:
         while not rospy.is_shutdown() and not shutdown_event.is_set():
@@ -298,11 +318,15 @@ def model_inference(args, config, ros_operator):
                             if dagger_result == "menu":
                                 continue
                         if result == "reset":
-                            recorder.save_episode()
                             episode_closed = True
-                            policy.reset_episode()
-                            ros_operator.move_arms_to_initial_pose(left0, right0)
-                            if _wait_after_reset() == "quit":
+                            if _reset_episode(
+                                policy,
+                                ros_operator,
+                                collector,
+                                recorder,
+                                left0,
+                                right0,
+                            ) == "quit":
                                 return
                             task_time = time.time()
                             restart_episode = True
@@ -318,13 +342,13 @@ def model_inference(args, config, ros_operator):
                 if force_replan or t % chunk_size == 0:
                     action_buffer = inference_fn_sync(args, config, policy, ros_operator)
                     if action_buffer is None:
-                        break
+                        raise RuntimeError("Model inference stopped: no synchronized observation available")
                     force_replan = False
 
                 act = action_buffer[t % chunk_size]
                 obs_to_save = get_rollout_observation(args, config, ros_operator) if recorder.enabled else None
                 if recorder.enabled and obs_to_save is None:
-                    break
+                    raise RuntimeError("Rollout recording stopped: no current observation available")
 
                 if args.ctrl_type == "joint":
                     left_action, right_action = process_action(config["task"], act)
@@ -345,8 +369,22 @@ def model_inference(args, config, ros_operator):
             if shutdown_event.is_set():
                 return
 
+    except Exception as exc:
+        faulted = True
+        try:
+            ros_operator.stop_follower_arms()
+        except Exception as stop_exc:
+            try:
+                rospy.logerr("Follower arm hold command failed: %s", stop_exc)
+            except Exception:
+                print(f"Follower arm hold command failed: {stop_exc}")
+        try:
+            rospy.logerr("DAgger stopped on first error: %s", exc)
+        except Exception:
+            print(f"DAgger stopped on first error: {exc}")
+        raise
     finally:
-        _restore_exit_state(ros_operator, left0, right0)
+        _restore_exit_state(ros_operator, left0, right0, move_to_initial=not faulted)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -413,6 +451,15 @@ def main():
         model_inference(args, config, ros_operator)
     except KeyboardInterrupt:
         pass
+    except Exception:
+        try:
+            ros_operator.stop_follower_arms()
+        except Exception as stop_exc:
+            try:
+                rospy.logerr("Follower arm hold command failed during shutdown: %s", stop_exc)
+            except Exception:
+                print(f"Follower arm hold command failed during shutdown: {stop_exc}")
+        raise
     finally:
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
 

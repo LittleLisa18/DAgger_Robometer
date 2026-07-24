@@ -699,6 +699,20 @@ class RosOperator:
             right_joint_positions,
         )
 
+    def stop_follower_arms(self):
+        """Immediately command both follower arms to hold their latest positions."""
+        if len(self.follower_left_arm_queue) == 0 or len(self.follower_right_arm_queue) == 0:
+            rospy.logerr("Cannot issue hold command: follower arm queues are empty")
+            return False
+
+        left_positions = list(self.follower_left_arm_queue[-1].position)
+        right_positions = list(self.follower_right_arm_queue[-1].position)
+        for _ in range(3):
+            self.follower_arm_publish(left_positions, right_positions)
+            rospy.sleep(0.02)
+        rospy.logerr("Follower arm motion stopped; holding latest joint positions")
+        return True
+
     def leader_arm_publish(self, left_joint_positions, right_joint_positions):
         self._publish_joint_pair(
             self._leader_cmd_left_pub,

@@ -105,16 +105,18 @@ class OpenpiClient:
             else None
         )
 
-    def reset_episode(self) -> None:
+    def reset_episode(self) -> bool:
         """Reset the live Robometer timeline without issuing policy inference."""
         if self.dashboard_reset_url is None:
-            return
-        try:
-            request = urllib.request.Request(self.dashboard_reset_url, data=b"", method="POST")
-            with urllib.request.urlopen(request, timeout=1.0):
-                pass
-        except Exception as exc:
-            print(f"Warning: failed to reset live Robometer episode: {exc}")
+            return True
+        for attempt in range(1, 4):
+            try:
+                request = urllib.request.Request(self.dashboard_reset_url, data=b"", method="POST")
+                with urllib.request.urlopen(request, timeout=1.0):
+                    return True
+            except Exception as exc:
+                print(f"Warning: failed to reset live Robometer episode ({attempt}/3): {exc}")
+        return False
 
     def _build_observation(self, payload) -> dict:
         images = [payload["top"], payload["left"], payload["right"]]
