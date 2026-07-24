@@ -77,7 +77,10 @@ def parse_args() -> Settings:
     parser.add_argument("--success-threshold", type=float, default=0.5)
     parser.add_argument(
         "--failure-timeout", type=float, default=None, metavar="SECONDS",
-        help="Mark the episode as failed when progress has not increased for this many seconds (disabled by default)",
+        help=(
+            "Mark the episode as failed when progress has not increased for this many seconds "
+            "and success probability is at or below --success-threshold (disabled by default)"
+        ),
     )
     parser.add_argument("--output-dir", default="robometer_live_runs")
     parser.add_argument("--use-frame-steps", action="store_true")
@@ -330,17 +333,22 @@ class LiveState:
                    progress_trace: list[float], success_trace: list[float]) -> None:
         now = time.time()
         clipped_progress = float(np.clip(progress, 0, 1))
+        clipped_success = float(np.clip(success, 0, 1))
         with self.lock:
             if request_episode != self.episode or self.paused:
                 return
             if self.best_progress is None or clipped_progress > self.best_progress + self.PROGRESS_INCREASE_EPSILON:
                 self.best_progress = clipped_progress
                 self.last_progress_increase_at = now
+            # A confident success invalidates any previously accumulated stall.
+            # If probability later drops, the failure timeout starts again here.
+            if clipped_success > self.settings.success_threshold:
+                self.last_progress_increase_at = now
         item = {
             "time": now, "elapsed": now - self.started_at,
             "source_elapsed": submitted - self.started_at,
             "progress": clipped_progress,
-            "success_probability": float(np.clip(success, 0, 1)),
+            "success_probability": clipped_success,
             "success": int(success >= self.settings.success_threshold),
             "latency_ms": round(latency * 1000, 1), "episode": request_episode,
             "task": self.task, "progress_trace": progress_trace, "success_trace": success_trace,
@@ -366,7 +374,12 @@ class LiveState:
             failure_timeout = self.settings.failure_timeout
             stalled_seconds = max(0.0, time.time() - self.last_progress_increase_at)
             if not self.paused and failure_timeout is not None and self.best_progress is not None:
-                self.failure = stalled_seconds >= failure_timeout
+                latest_success = self.samples[-1]["success_probability"] if self.samples else None
+                self.failure = (
+                    latest_success is not None
+                    and latest_success <= self.settings.success_threshold
+                    and stalled_seconds >= failure_timeout
+                )
             return {
                 "task": self.task, "episode": self.episode, "status": self.status, "error": self.error,
                 "threshold": self.settings.success_threshold, "policy_requests": self.policy_requests,

@@ -94,6 +94,35 @@ def load_results(results_dir: Path, video_stem: str):
     return progress, probability
 
 
+def failure_timeline(
+    progress: np.ndarray,
+    probability: np.ndarray,
+    inference_fps: float,
+    failure_timeout: float | None,
+    progress_increase_epsilon: float,
+    success_threshold: float,
+) -> np.ndarray:
+    """Return failure state after each sample using progress and success confidence."""
+    failure = np.zeros(len(progress), dtype=bool)
+    if failure_timeout is None:
+        return failure
+
+    best_progress = float(progress[0])
+    last_reset_time = 0.0
+    for index, (progress_value, success_probability) in enumerate(zip(progress, probability)):
+        sample_time = index / inference_fps
+        if float(progress_value) > best_progress + progress_increase_epsilon:
+            best_progress = float(progress_value)
+            last_reset_time = sample_time
+        if float(success_probability) > success_threshold:
+            last_reset_time = sample_time
+        failure[index] = (
+            float(success_probability) <= success_threshold
+            and sample_time - last_reset_time >= failure_timeout
+        )
+    return failure
+
+
 def draw_chart(canvas, box, title, values, color, visible_count, current_x, binary=False):
     x1, y1, x2, y2 = box
     rounded_panel(canvas, (x1, y1), (x2, y2))
@@ -145,16 +174,14 @@ def main() -> None:
     progress, probability = load_results(results_dir, video_path.stem)
     binary = (probability >= args.success_threshold).astype(np.float32)
 
-    failure_by_sample = np.zeros(len(progress), dtype=bool)
-    if args.failure_timeout is not None:
-        best_progress = float(progress[0])
-        last_increase_time = 0.0
-        for index, value in enumerate(progress):
-            sample_time = index / args.inference_fps
-            if float(value) > best_progress + args.progress_increase_epsilon:
-                best_progress = float(value)
-                last_increase_time = sample_time
-            failure_by_sample[index] = sample_time - last_increase_time >= args.failure_timeout
+    failure_by_sample = failure_timeline(
+        progress,
+        probability,
+        args.inference_fps,
+        args.failure_timeout,
+        args.progress_increase_epsilon,
+        args.success_threshold,
+    )
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():

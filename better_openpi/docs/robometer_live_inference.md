@@ -51,7 +51,11 @@ If Robometer is on another machine, set `--robometer-url http://<reward-server-i
 
 To enable failure highlighting when progress does not increase, add (for example)
 `--failure-timeout 5`. If omitted, the feature is disabled. Progress changes of
-0.05 or less are treated as model jitter rather than an increase.
+0.05 or less are treated as model jitter rather than an increase. Failure is reported
+only when that timeout is reached and the current success probability is at or below
+`--success-threshold`. A probability above the threshold clears the accumulated
+stall duration; if it later drops, the timeout starts again from that high-probability
+sample.
 
 ## 3. Connect the robot and view the dashboard
 
