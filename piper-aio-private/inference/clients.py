@@ -100,6 +100,9 @@ class OpenpiClient:
         self.dashboard_reset_url = (
             f"http://{host}:{dashboard_port}/api/reset" if dashboard_port is not None else None
         )
+        self.dashboard_standby_url = (
+            f"http://{host}:{dashboard_port}/api/standby" if dashboard_port is not None else None
+        )
         self.dashboard_state_url = (
             f"http://{host}:{dashboard_port}/api/state" if dashboard_port is not None else None
         )
@@ -116,6 +119,20 @@ class OpenpiClient:
             if dashboard_port is not None
             else None
         )
+
+    def standby_robometer(self) -> bool:
+        """Clear and freeze Robometer until the operator starts the episode."""
+        if self.dashboard_standby_url is None:
+            return True
+        try:
+            request = urllib.request.Request(self.dashboard_standby_url, data=b"", method="POST")
+            with urllib.request.urlopen(request, timeout=1.0):
+                self._failure_latched = False
+                self._last_failure_check = 0.0
+                return True
+        except Exception as exc:
+            print(f"Warning: failed to put live Robometer in standby: {exc}")
+            return False
 
     def reset_episode(self) -> bool:
         """Reset the live Robometer timeline without issuing policy inference."""

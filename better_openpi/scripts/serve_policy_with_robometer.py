@@ -248,6 +248,14 @@ class LiveState:
             except queue.Empty:
                 pass
 
+    def standby(self) -> None:
+        """Clear all progress and ignore observations until the operator starts."""
+        self.reset()
+        with self.lock:
+            self.paused = True
+            self.failure = False
+            self.status = "waiting for operator to start"
+
     def pause(self) -> None:
         """Freeze Robometer at its current result until resume or reset."""
         with self.lock:
@@ -421,6 +429,9 @@ def dashboard_handler(state: LiveState) -> type[BaseHTTPRequestHandler]:
         def do_POST(self) -> None:
             if self.path == "/api/reset":
                 state.reset()
+                self._send(b'{"ok":true}', "application/json")
+            elif self.path == "/api/standby":
+                state.standby()
                 self._send(b'{"ok":true}', "application/json")
             elif self.path == "/api/pause":
                 state.pause()

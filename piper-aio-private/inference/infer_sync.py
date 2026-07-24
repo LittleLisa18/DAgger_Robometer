@@ -111,11 +111,16 @@ def model_inference(args, config, ros_operator):
 
     ros_operator.follower_arm_publish_continuous(left0, right0)
 
+    if not policy.standby_robometer():
+        raise RuntimeError("Startup aborted: live Robometer could not enter standby")
+
     print("Warmup the server...")
     policy.warmup()
     print("Server warmed up")
 
-    input("Press enter to continue")
+    input("Press Enter to Continue")
+    if not policy.reset_episode():
+        raise RuntimeError("Startup aborted: live Robometer could not start the episode")
     task_time = time.time()
     ros_operator.follower_arm_publish_continuous(left0, right0)
     recorder = InferenceDataRecorder(args, config, shutdown_event=shutdown_event)
@@ -149,7 +154,7 @@ def model_inference(args, config, ros_operator):
                             raise RuntimeError("Reset aborted: live Robometer episode could not be reset")
                         # Reset to starting position
                         ros_operator.follower_arm_publish_continuous(left0, right0)
-                        input("Press enter to continue")
+                        input("Press Enter to Continue")
                         task_time = time.time()
                         break  # Break inner loop to restart
                     elif result == "quit":
