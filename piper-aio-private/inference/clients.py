@@ -1,4 +1,5 @@
 import io
+import json
 import queue
 import threading
 import time
@@ -99,6 +100,11 @@ class OpenpiClient:
         self.dashboard_reset_url = (
             f"http://{host}:{dashboard_port}/api/reset" if dashboard_port is not None else None
         )
+        self.dashboard_state_url = (
+            f"http://{host}:{dashboard_port}/api/state" if dashboard_port is not None else None
+        )
+        self._failure_latched = False
+        self._last_failure_check = 0.0
         self.preview = (
             _DashboardPreviewSender(f"http://{host}:{dashboard_port}/api/preview")
             if dashboard_port is not None
@@ -113,10 +119,38 @@ class OpenpiClient:
             try:
                 request = urllib.request.Request(self.dashboard_reset_url, data=b"", method="POST")
                 with urllib.request.urlopen(request, timeout=1.0):
+                    self._failure_latched = False
+                    self._last_failure_check = 0.0
                     return True
             except Exception as exc:
                 print(f"Warning: failed to reset live Robometer episode ({attempt}/3): {exc}")
         return False
+
+    def consume_failure_event(self, min_interval: float = 0.1) -> bool:
+        """Return True once when the live Robometer first detects failure."""
+        if self.dashboard_state_url is None:
+            return False
+
+        now = time.monotonic()
+        if now - self._last_failure_check < min_interval:
+            return False
+        self._last_failure_check = now
+
+        try:
+            with urllib.request.urlopen(self.dashboard_state_url, timeout=0.2) as response:
+                failure = bool(json.loads(response.read()).get("failure", False))
+        except Exception:
+            # Dashboard availability is handled independently from policy inference.
+            return False
+
+        if not failure:
+            self._failure_latched = False
+            return False
+        if self._failure_latched:
+            return False
+
+        self._failure_latched = True
+        return True
 
     def _build_observation(self, payload) -> dict:
         images = [payload["top"], payload["left"], payload["right"]]

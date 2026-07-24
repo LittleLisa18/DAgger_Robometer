@@ -67,6 +67,54 @@ def _on_sigint(signum, frame):
         pass
 
 
+class _FailurePauseMonitor:
+    """Poll Robometer independently so policy inference cannot delay a stop."""
+
+    def __init__(self, policy, ros_operator, command_lock, poll_interval=0.05):
+        self.policy = policy
+        self.ros_operator = ros_operator
+        self.command_lock = command_lock
+        self.poll_interval = poll_interval
+        self.pause_event = threading.Event()
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(
+            target=self._run, name="robometer-failure-monitor", daemon=True
+        )
+
+    def start(self):
+        self.thread.start()
+
+    def stop(self):
+        self.stop_event.set()
+        self.thread.join(timeout=1.0)
+
+    def clear_pause(self):
+        self.pause_event.clear()
+
+    def _run(self):
+        while not self.stop_event.is_set() and not shutdown_event.is_set():
+            if self.pause_event.is_set():
+                self.stop_event.wait(self.poll_interval)
+                continue
+            if not self.policy.consume_failure_event(min_interval=0.0):
+                self.stop_event.wait(self.poll_interval)
+                continue
+
+            # Set the event before taking the command lock. The publishing loop
+            # checks it while holding the same lock, so no stale action can be
+            # published after the hold command.
+            self.pause_event.set()
+            try:
+                with self.command_lock:
+                    self.ros_operator.stop_follower_arms()
+            except Exception as exc:
+                try:
+                    rospy.logerr("Robometer failure hold command failed: %s", exc)
+                except Exception:
+                    print(f"Robometer failure hold command failed: {exc}")
+            print("\n\033[31mRobometer detected FAILURE; inference paused.\033[0m")
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # DAgger data collector
 # ──────────────────────────────────────────────────────────────────────────────
@@ -293,6 +341,9 @@ def model_inference(args, config, ros_operator):
     max_publish_step = config["episode_len"]
     rate = rospy.Rate(args.publish_rate)
     faulted = False
+    command_lock = threading.Lock()
+    failure_monitor = _FailurePauseMonitor(policy, ros_operator, command_lock)
+    failure_monitor.start()
 
     try:
         while not rospy.is_shutdown() and not shutdown_event.is_set():
@@ -303,11 +354,13 @@ def model_inference(args, config, ros_operator):
             episode_closed = False
 
             while t < max_publish_step and not rospy.is_shutdown() and not shutdown_event.is_set():
-                key = check_keyboard_input()
+                key = " " if failure_monitor.pause_event.is_set() else check_keyboard_input()
                 if key == " ":
                     restart_episode = False
                     while True:
                         result = handle_interactive_mode(task_time, enable_dagger=True)
+                        # Failure is edge-triggered; the operator has now chosen what to do.
+                        failure_monitor.clear_pause()
                         if result == "dagger":
                             dagger_result = run_dagger_session(args, config, ros_operator, collector, recorder)
                             if dagger_result == "shutdown":
@@ -345,19 +398,26 @@ def model_inference(args, config, ros_operator):
                         raise RuntimeError("Model inference stopped: no synchronized observation available")
                     force_replan = False
 
+                # Discard actions returned after failure was detected during inference.
+                if failure_monitor.pause_event.is_set():
+                    force_replan = True
+                    continue
+
                 act = action_buffer[t % chunk_size]
                 obs_to_save = get_rollout_observation(args, config, ros_operator) if recorder.enabled else None
                 if recorder.enabled and obs_to_save is None:
                     raise RuntimeError("Rollout recording stopped: no current observation available")
 
-                if args.ctrl_type == "joint":
-                    left_action, right_action = process_action(config["task"], act)
-                    action_to_save = np.concatenate((left_action, right_action))
-                    ros_operator.follower_arm_publish(left_action, right_action)
-                elif args.ctrl_type == "eef":
-                    left_action, right_action = process_action(config["task"], act)
-                    action_to_save = np.concatenate((left_action, right_action))
-                    ros_operator.follower_arm_pose_publish(left_action, right_action)
+                left_action, right_action = process_action(config["task"], act)
+                action_to_save = np.concatenate((left_action, right_action))
+                with command_lock:
+                    if failure_monitor.pause_event.is_set():
+                        force_replan = True
+                        continue
+                    if args.ctrl_type == "joint":
+                        ros_operator.follower_arm_publish(left_action, right_action)
+                    elif args.ctrl_type == "eef":
+                        ros_operator.follower_arm_pose_publish(left_action, right_action)
 
                 recorder.add_step(obs_to_save, action_to_save)
                 t += 1
@@ -384,6 +444,7 @@ def model_inference(args, config, ros_operator):
             print(f"DAgger stopped on first error: {exc}")
         raise
     finally:
+        failure_monitor.stop()
         _restore_exit_state(ros_operator, left0, right0, move_to_initial=not faulted)
 
 
