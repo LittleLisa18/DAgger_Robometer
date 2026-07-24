@@ -1,0 +1,99 @@
+shared_defaults:
+  default_left0: &default_left0 [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  default_right0: &default_right0 [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  default_right_gripper_postprocess: &default_right_gripper_postprocess
+    - when: below
+      threshold: 0.05
+      add: -0.01
+    - when: above
+      threshold: 0.05
+      add: 0.01
+  fix_both_arms_to_initial_pose: &fix_both_arms_to_initial_pose
+    fix_arms_to_initial_pose: [left, right]
+
+towel:
+  language_instruction: "Fold the towel."
+  left0: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.1]
+  right0: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.1]
+  action_postprocess:
+    left_gripper:
+      - when: below
+        threshold: 0.02
+        set: 0.0
+    right_gripper:
+      - when: below
+        threshold: 0.02
+        set: 0.0
+
+rubbish:
+  language_instruction: "Pick up the trash and throw it in the trash bin."
+  left0: *default_left0
+  right0: *default_right0
+  action_postprocess:
+    right_gripper: *default_right_gripper_postprocess
+
+tissue:
+  language_instruction: "Pick up a pack of tissue paper and put it in the plastic basket."
+  left0: *default_left0
+  right0: *default_right0
+  action_postprocess:
+    right_gripper: *default_right_gripper_postprocess
+
+beverage:
+  language_instruction: "Pick up the beverage and put it in the paper box."
+  left0: *default_left0
+  right0: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.1]
+  action_postprocess:
+    right_gripper: *default_right_gripper_postprocess
+    fix_arms_to_initial_pose: [left]
+
+play_pp:
+  language_instruction: "Hit the table tennis ball to the opponent."
+  left0: [-0.1, 0.01, 0.0, 0.0, 0.2, 0.0, 0.0]
+  right0: [0.19, 1.0, -0.9, 0.0, 0.0, 0.0, 0.0]
+  action_postprocess:
+    right_gripper:
+      - set: 0.0
+
+pick_pp:
+  language_instruction: "Pick up the rolling table tennis ball."
+  left0: *default_left0
+  right0: *default_right0
+  action_postprocess:
+    right_gripper:
+      - when: below
+        threshold: 0.03
+        add: -0.01
+
+cup:
+  language_instruction: "Pick up the paper cup and put it into the cup sleeve."
+  left0: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0]
+  right0: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.1]
+
+plug:
+  language_instruction: "Plug the charger into the socket."
+  left0: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0]
+  right0: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.028]
+
+guess:
+  language_instruction: "Pick up the cup that contains the hidden object after the shuffles."
+  left0: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0]
+  right0: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.1]
+
+pick:
+  language_instruction: "Pick up the rolling bottle."
+  left0: [0.0, -0.04, 0.04, 0.76, 0.0, 0.0, 0]
+  right0: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.2]
+
+insert:
+  language_instruction: "Insert the pen from one bottle into another bottle."
+  left0: [0.0, -0.04, 0.04, 0.76, 0.0, 0.0, 0]
+  right0: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.2]
+
+fold_dishcloth:
+  language_instruction: "fold the dishcloth in half twice, then place it in the position slightly to the front and left"
+  left0: *default_left0
+  right0: *default_right0
+  action_postprocess: 
+    fix_arms_to_initial_pose: [right]
+    # fix_arms_to_initial_pose_targets: [action]
