@@ -43,6 +43,54 @@ def _on_sigint(signum, frame):
         pass
 
 
+class _FailurePauseMonitor:
+    """Poll the local Robometer dashboard independently of policy inference."""
+
+    def __init__(self, policy, ros_operator, command_lock, poll_interval=0.05):
+        self.policy = policy
+        self.ros_operator = ros_operator
+        self.command_lock = command_lock
+        self.poll_interval = poll_interval
+        self.pause_event = threading.Event()
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(
+            target=self._run, name="robometer-failure-monitor", daemon=True
+        )
+
+    def start(self):
+        self.thread.start()
+
+    def stop(self):
+        self.stop_event.set()
+        self.thread.join(timeout=1.0)
+
+    def clear_pause(self):
+        self.pause_event.clear()
+
+    def _run(self):
+        while not self.stop_event.is_set() and not shutdown_event.is_set():
+            if self.pause_event.is_set():
+                self.stop_event.wait(self.poll_interval)
+                continue
+            if not self.policy.consume_failure_event(min_interval=0.0):
+                self.stop_event.wait(self.poll_interval)
+                continue
+
+            # Latch first, then hold under the action-publishing lock so no
+            # buffered action can be published after the hold command.
+            self.pause_event.set()
+            try:
+                with self.command_lock:
+                    self.ros_operator.stop_follower_arms()
+            except Exception as exc:
+                try:
+                    rospy.logerr("Robometer failure hold command failed: %s", exc)
+                except Exception:
+                    print(f"Robometer failure hold command failed: {exc}")
+            self.policy.pause_robometer()
+            print("\n\033[31mRobometer detected FAILURE; robot and Robometer paused.\033[0m")
+
+
 # Main loop for the manipulation task
 def model_inference(args, config, ros_operator):
     if args.model == "openpi":
@@ -71,6 +119,9 @@ def model_inference(args, config, ros_operator):
     task_time = time.time()
     ros_operator.follower_arm_publish_continuous(left0, right0)
     recorder = InferenceDataRecorder(args, config, shutdown_event=shutdown_event)
+    command_lock = threading.Lock()
+    failure_monitor = _FailurePauseMonitor(policy, ros_operator, command_lock)
+    failure_monitor.start()
 
     try:
         # Inference loop
@@ -81,17 +132,21 @@ def model_inference(args, config, ros_operator):
 
             reset_observation_window()
             action_buffer = np.zeros([chunk_size, config["state_dim"]])
+            force_replan = True
             episode_closed = False
 
             while t < max_publish_step and not rospy.is_shutdown() and not shutdown_event.is_set():
                 # Check for keyboard input (space to enter interactive mode)
-                key = check_keyboard_input()
+                failure_pause = failure_monitor.pause_event.is_set()
+                key = " " if failure_pause else check_keyboard_input()
                 if key == " ":
                     result = handle_interactive_mode(task_time)
                     if result == "reset":
+                        failure_monitor.clear_pause()
                         recorder.save_episode()
                         episode_closed = True
-                        policy.reset_episode()
+                        if not policy.reset_episode():
+                            raise RuntimeError("Reset aborted: live Robometer episode could not be reset")
                         # Reset to starting position
                         ros_operator.follower_arm_publish_continuous(left0, right0)
                         input("Press enter to continue")
@@ -100,10 +155,14 @@ def model_inference(args, config, ros_operator):
                     elif result == "quit":
                         recorder.save_episode()
                         return  # Exit the function entirely
-                    # 'continue' just resumes the loop
+                    if failure_pause:
+                        if not policy.resume_robometer():
+                            raise RuntimeError("Continue aborted: live Robometer could not be resumed")
+                        failure_monitor.clear_pause()
+                    force_replan = True
 
                 # When coming to the end of the action chunk
-                if t % chunk_size == 0:
+                if force_replan or t % chunk_size == 0:
                     # Start inference
                     action_buffer = inference_fn_sync(args, config, policy, ros_operator)
                     if action_buffer is None:
@@ -112,6 +171,12 @@ def model_inference(args, config, ros_operator):
                     assert (
                         action_buffer.shape[0] >= chunk_size
                     ), f"Action chunk length {action_buffer.shape[0]} is smaller than {chunk_size}"
+                    force_replan = False
+
+                # Discard an action chunk returned while failure was being detected.
+                if failure_monitor.pause_event.is_set():
+                    force_replan = True
+                    continue
 
                 act = action_buffer[t % chunk_size]
                 observation_to_save = get_rollout_observation(args, config, ros_operator) if recorder.enabled else None
@@ -121,11 +186,17 @@ def model_inference(args, config, ros_operator):
                 if args.ctrl_type == "joint":
                     left_action, right_action = process_action(config["task"], act)
                     action_to_save = np.concatenate((left_action, right_action), axis=0)
-                    ros_operator.follower_arm_publish(left_action, right_action)
+                    publish_action = ros_operator.follower_arm_publish
                 elif args.ctrl_type == "eef":
                     left_action, right_action = process_action(config["task"], act)
                     action_to_save = np.concatenate((left_action, right_action), axis=0)
-                    ros_operator.follower_arm_pose_publish(left_action, right_action)
+                    publish_action = ros_operator.follower_arm_pose_publish
+
+                with command_lock:
+                    if failure_monitor.pause_event.is_set():
+                        force_replan = True
+                        continue
+                    publish_action(left_action, right_action)
 
                 recorder.add_step(observation_to_save, action_to_save)
                 t += 1
@@ -137,7 +208,12 @@ def model_inference(args, config, ros_operator):
             if shutdown_event.is_set():
                 return
     finally:
-        ros_operator.follower_arm_publish_continuous(left0, right0)
+        failure_active = failure_monitor.pause_event.is_set()
+        failure_monitor.stop()
+        if failure_active:
+            ros_operator.stop_follower_arms()
+        else:
+            ros_operator.follower_arm_publish_continuous(left0, right0)
 
 
 def get_arguments():
