@@ -49,13 +49,19 @@ directory containing `params/` and `assets/`, not to `params/` itself.
 
 If Robometer is on another machine, set `--robometer-url http://<reward-server-ip>:8001`.
 
-To enable failure highlighting when progress does not increase, add (for example)
-`--failure-timeout 5`. If omitted, the feature is disabled. Progress changes of
-0.05 or less are treated as model jitter rather than an increase. Failure is reported
-only when that timeout is reached and the current success probability is at or below
-`--success-threshold`. A probability above the threshold clears the accumulated
-stall duration; if it later drops, the timeout starts again from that high-probability
-sample.
+To enable failure highlighting, set `--failure-timeout` to the progress comparison
+window in seconds; omitting it disables automatic failure detection. The monitor
+compares median progress from the beginning and end of that window. Failure requires
+the smoothed gain to be below `--failure-min-progress-gain`.
+`--progress-smoothing-window` controls the median windows used to reject individual
+prediction spikes. When `--failure-success-threshold` is provided, failure
+additionally requires success probability to stay at or below that threshold for
+`--failure-low-success-duration` seconds.
+
+`--success-threshold` independently controls the per-sample binary success indicator.
+The success-probability condition is optional: when
+`--failure-success-threshold` is omitted, automatic failure detection uses only the
+smoothed progress condition and ignores `--failure-low-success-duration`.
 
 ## 3. Connect the robot and view the dashboard
 

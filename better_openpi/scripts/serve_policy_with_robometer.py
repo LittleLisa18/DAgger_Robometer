@@ -54,7 +54,11 @@ class Settings:
     monitor_interval: float
     timeout: float
     success_threshold: float
+    failure_success_threshold: float | None
     failure_timeout: float | None
+    failure_min_progress_gain: float
+    failure_low_success_duration: float
+    progress_smoothing_window: float
     output_dir: Path
     use_frame_steps: bool
     record_policy: bool
@@ -74,13 +78,34 @@ def parse_args() -> Settings:
     parser.add_argument("--max-frames", type=int, default=16, help="Evenly retained frames per Robometer request")
     parser.add_argument("--monitor-interval", type=float, default=1.0, help="Minimum seconds between monitor requests")
     parser.add_argument("--timeout", type=float, default=120.0)
-    parser.add_argument("--success-threshold", type=float, default=0.5)
+    parser.add_argument(
+        "--success-threshold", type=float, default=0.5,
+        help="Probability threshold used only for the binary success indicator",
+    )
+    parser.add_argument(
+        "--failure-success-threshold", type=float, default=None,
+        help=(
+            "Optionally require success probability to stay at or below this value during "
+            "stalled-progress failure detection; omit to ignore success probability"
+        ),
+    )
     parser.add_argument(
         "--failure-timeout", type=float, default=None, metavar="SECONDS",
         help=(
-            "Mark the episode as failed when progress has not increased for this many seconds "
-            "and success probability is at or below --success-threshold (disabled by default)"
+            "Progress comparison window used for failure detection; omit to disable automatic failure detection"
         ),
+    )
+    parser.add_argument(
+        "--failure-min-progress-gain", type=float, default=0.05,
+        help="Minimum smoothed progress gain required across --failure-timeout",
+    )
+    parser.add_argument(
+        "--failure-low-success-duration", type=float, default=2.0, metavar="SECONDS",
+        help="Require success probability to remain low for this long before reporting failure",
+    )
+    parser.add_argument(
+        "--progress-smoothing-window", type=float, default=1.0, metavar="SECONDS",
+        help="Median smoothing window used at both ends of the progress comparison",
     )
     parser.add_argument("--output-dir", default="robometer_live_runs")
     parser.add_argument("--use-frame-steps", action="store_true")
@@ -91,8 +116,18 @@ def parse_args() -> Settings:
         parser.error("max-frames and timeout must be positive; monitor-interval must be non-negative")
     if not 0 <= args.success_threshold <= 1:
         parser.error("success-threshold must be in [0, 1]")
+    if args.failure_success_threshold is not None and not 0 <= args.failure_success_threshold <= 1:
+        parser.error("failure-success-threshold must be in [0, 1]")
     if args.failure_timeout is not None and args.failure_timeout <= 0:
         parser.error("failure-timeout must be positive")
+    if not 0 <= args.failure_min_progress_gain <= 1:
+        parser.error("failure-min-progress-gain must be in [0, 1]")
+    if args.failure_low_success_duration < 0:
+        parser.error("failure-low-success-duration must be non-negative")
+    if args.progress_smoothing_window <= 0:
+        parser.error("progress-smoothing-window must be positive")
+    if args.failure_timeout is not None and args.progress_smoothing_window > args.failure_timeout:
+        parser.error("progress-smoothing-window must not exceed failure-timeout")
     return Settings(
         policy_config=args.policy_config,
         checkpoint=args.checkpoint,
@@ -106,7 +141,11 @@ def parse_args() -> Settings:
         monitor_interval=args.monitor_interval,
         timeout=args.timeout,
         success_threshold=args.success_threshold,
+        failure_success_threshold=args.failure_success_threshold,
         failure_timeout=args.failure_timeout,
+        failure_min_progress_gain=args.failure_min_progress_gain,
+        failure_low_success_duration=args.failure_low_success_duration,
+        progress_smoothing_window=args.progress_smoothing_window,
         output_dir=Path(args.output_dir).expanduser().resolve(),
         use_frame_steps=args.use_frame_steps,
         record_policy=args.record_policy,
@@ -196,9 +235,6 @@ def _parse_result(payload: dict[str, Any]) -> tuple[float, float, list[float], l
 
 
 class LiveState:
-    # Ignore tiny prediction jitter when deciding whether progress increased.
-    PROGRESS_INCREASE_EPSILON = 0.05
-
     def __init__(self, settings: Settings):
         self.settings = settings
         self.lock = threading.Lock()
@@ -215,8 +251,6 @@ class LiveState:
         self.error: str | None = None
         self.dropped = 0
         self.policy_requests = 0
-        self.best_progress: float | None = None
-        self.last_progress_increase_at = self.started_at
         self.paused = False
         self.failure = False
         self.job_queue: queue.Queue[tuple[np.ndarray, str, float, int]] = queue.Queue(maxsize=1)
@@ -236,8 +270,6 @@ class LiveState:
             self.episode += 1
             self.policy_requests = 0
             self.dropped = 0
-            self.best_progress = None
-            self.last_progress_increase_at = self.started_at
             self.paused = False
             self.failure = False
             self.status = "episode reset"
@@ -276,7 +308,6 @@ class LiveState:
         with self.lock:
             self.paused = False
             self.failure = False
-            self.last_progress_increase_at = time.time()
             self.last_submit = 0.0
             self.status = "live" if self.samples else "waiting for observations"
 
@@ -303,8 +334,7 @@ class LiveState:
                 self.samples.clear()
                 self.started_at = now
                 self.episode += 1
-                self.best_progress = None
-                self.last_progress_increase_at = now
+                self.failure = False
             self.task = task
             self.policy_requests += 1
             self.frames.append(frame)
@@ -337,19 +367,12 @@ class LiveState:
         with self.lock:
             if request_episode != self.episode or self.paused:
                 return
-            if self.best_progress is None or clipped_progress > self.best_progress + self.PROGRESS_INCREASE_EPSILON:
-                self.best_progress = clipped_progress
-                self.last_progress_increase_at = now
-            # A confident success invalidates any previously accumulated stall.
-            # If probability later drops, the failure timeout starts again here.
-            if clipped_success > self.settings.success_threshold:
-                self.last_progress_increase_at = now
         item = {
             "time": now, "elapsed": now - self.started_at,
             "source_elapsed": submitted - self.started_at,
             "progress": clipped_progress,
             "success_probability": clipped_success,
-            "success": int(success >= self.settings.success_threshold),
+            "success": int(clipped_success >= self.settings.success_threshold),
             "latency_ms": round(latency * 1000, 1), "episode": request_episode,
             "task": self.task, "progress_trace": progress_trace, "success_trace": success_trace,
         }
@@ -372,20 +395,66 @@ class LiveState:
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
             failure_timeout = self.settings.failure_timeout
-            stalled_seconds = max(0.0, time.time() - self.last_progress_increase_at)
-            if not self.paused and failure_timeout is not None and self.best_progress is not None:
-                latest_success = self.samples[-1]["success_probability"] if self.samples else None
+            progress_gain: float | None = None
+            low_success_seconds = 0.0
+            progress_window_ready = False
+
+            if self.samples and self.settings.failure_success_threshold is not None:
+                low_start: float | None = None
+                for sample in reversed(self.samples):
+                    if sample["success_probability"] > self.settings.failure_success_threshold:
+                        break
+                    low_start = sample["time"]
+                if low_start is not None:
+                    # Measure observed low-probability coverage, not wall-clock time
+                    # after the monitor stops producing samples.
+                    low_success_seconds = max(0.0, self.samples[-1]["time"] - low_start)
+
+            if failure_timeout is not None and self.samples:
+                smoothing = self.settings.progress_smoothing_window
+                # Anchor the comparison to the latest prediction so dashboard
+                # polling delay cannot move samples in or out of the window.
+                latest_sample_time = self.samples[-1]["time"]
+                baseline_start = latest_sample_time - failure_timeout
+                baseline_end = baseline_start + smoothing
+                recent_start = latest_sample_time - smoothing
+                baseline = [
+                    sample["progress"] for sample in self.samples
+                    if baseline_start <= sample["time"] <= baseline_end
+                ]
+                recent = [
+                    sample["progress"] for sample in self.samples
+                    if sample["time"] >= recent_start
+                ]
+                progress_window_ready = bool(baseline and recent)
+                if progress_window_ready:
+                    progress_gain = float(np.median(recent) - np.median(baseline))
+
+            if not self.paused and failure_timeout is not None:
+                success_condition_met = (
+                    self.settings.failure_success_threshold is None
+                    or low_success_seconds >= self.settings.failure_low_success_duration
+                )
                 self.failure = (
-                    latest_success is not None
-                    and latest_success <= self.settings.success_threshold
-                    and stalled_seconds >= failure_timeout
+                    progress_window_ready
+                    and progress_gain is not None
+                    and progress_gain < self.settings.failure_min_progress_gain
+                    and success_condition_met
                 )
             return {
                 "task": self.task, "episode": self.episode, "status": self.status, "error": self.error,
-                "threshold": self.settings.success_threshold, "policy_requests": self.policy_requests,
+                "threshold": self.settings.success_threshold,
+                "failure_success_threshold": self.settings.failure_success_threshold,
+                "failure_uses_success_probability": self.settings.failure_success_threshold is not None,
+                "policy_requests": self.policy_requests,
                 "dropped_monitor_jobs": self.dropped, "log_path": str(self.log_path),
                 "failure": self.failure, "paused": self.paused, "failure_timeout": failure_timeout,
-                "progress_stalled_seconds": stalled_seconds,
+                "failure_min_progress_gain": self.settings.failure_min_progress_gain,
+                "failure_low_success_duration": self.settings.failure_low_success_duration,
+                "progress_smoothing_window": self.settings.progress_smoothing_window,
+                "progress_window_ready": progress_window_ready,
+                "progress_gain": progress_gain,
+                "low_success_seconds": low_success_seconds,
                 "samples": list(self.samples),
             }
 
@@ -418,7 +487,7 @@ DASHBOARD_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
 <div><div class="cards"><div class="panel">Progress<div id="progress" class="value blue">—</div></div><div class="panel">Success<div id="binary" class="value green">—</div></div><div class="panel">Probability<div id="prob" class="value purple">—</div></div></div>
 <div class="panel">Task Progress<canvas id="pchart"></canvas></div><div class="panel">Success / Probability<canvas id="schart"></canvas></div></div></div></main>
 <script>function chart(id,a,b){const c=document.getElementById(id),d=devicePixelRatio||1,w=c.clientWidth,h=c.clientHeight;c.width=w*d;c.height=h*d;const x=c.getContext('2d');x.scale(d,d);x.strokeStyle='#3e4654';x.lineWidth=1;for(let i=0;i<3;i++){let y=12+i*(h-24)/2;x.beginPath();x.moveTo(35,y);x.lineTo(w-8,y);x.stroke()}function line(v,color,step){if(!v.length)return;x.strokeStyle=color;x.lineWidth=3;x.beginPath();v.forEach((q,i)=>{let xx=35+i*(w-45)/Math.max(1,v.length-1),yy=h-12-Math.max(0,Math.min(1,q))*(h-24);if(!i)x.moveTo(xx,yy);else if(step){x.lineTo(xx,py);x.lineTo(xx,yy)}else x.lineTo(xx,yy);py=yy});x.stroke()}let py=0;line(a,'#53beff',false);line(b,'#da86ff',false)}
-async function update(){try{let s=await(await fetch('/api/state',{cache:'no-store'})).json(),a=s.samples,p=a.map(x=>x.progress),q=a.map(x=>x.success_probability),b=a.map(x=>x.success),v=document.getElementById('video-panel');v.classList.toggle('failure',s.failure);document.getElementById('task').textContent='Episode '+s.episode+' — '+(s.task||'No prompt');let f=s.failure?' | FAILURE: progress stalled '+s.progress_stalled_seconds.toFixed(1)+'s':'';document.getElementById('meta').textContent=s.status+f+' | policy requests '+s.policy_requests+' | dropped monitor jobs '+s.dropped_monitor_jobs+' | '+s.log_path;document.getElementById('error').textContent=s.error||'';if(a.length){let z=a[a.length-1];document.getElementById('progress').textContent=z.progress.toFixed(3);document.getElementById('prob').textContent=z.success_probability.toFixed(3);document.getElementById('binary').textContent=z.success?'YES':'NO'}else{document.getElementById('progress').textContent='—';document.getElementById('prob').textContent='—';document.getElementById('binary').textContent='—'}chart('pchart',p,[]);chart('schart',b,q);document.getElementById('camera').src='/frame.jpg?t='+Date.now()}catch(e){document.getElementById('error').textContent=e}}async function resetEpisode(){await fetch('/api/reset',{method:'POST'});update()}setInterval(update,200);update();</script></body></html>"""
+async function update(){try{let s=await(await fetch('/api/state',{cache:'no-store'})).json(),a=s.samples,p=a.map(x=>x.progress),q=a.map(x=>x.success_probability),b=a.map(x=>x.success),v=document.getElementById('video-panel');v.classList.toggle('failure',s.failure);document.getElementById('task').textContent='Episode '+s.episode+' — '+(s.task||'No prompt');let g=s.progress_gain===null?'—':s.progress_gain.toFixed(3),f=s.failure?' | FAILURE: progress gain '+g+', low success '+s.low_success_seconds.toFixed(1)+'s':'';document.getElementById('meta').textContent=s.status+f+' | policy requests '+s.policy_requests+' | dropped monitor jobs '+s.dropped_monitor_jobs+' | '+s.log_path;document.getElementById('error').textContent=s.error||'';if(a.length){let z=a[a.length-1];document.getElementById('progress').textContent=z.progress.toFixed(3);document.getElementById('prob').textContent=z.success_probability.toFixed(3);document.getElementById('binary').textContent=z.success?'YES':'NO'}else{document.getElementById('progress').textContent='—';document.getElementById('prob').textContent='—';document.getElementById('binary').textContent='—'}chart('pchart',p,[]);chart('schart',b,q);document.getElementById('camera').src='/frame.jpg?t='+Date.now()}catch(e){document.getElementById('error').textContent=e}}async function resetEpisode(){await fetch('/api/reset',{method:'POST'});update()}setInterval(update,200);update();</script></body></html>"""
 
 
 def dashboard_handler(state: LiveState) -> type[BaseHTTPRequestHandler]:
