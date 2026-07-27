@@ -6,10 +6,7 @@ XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/serve_policy_with_robometer.py
     --dashboard-port 8080 \
     --camera cam_high \
     --failure-timeout 4 \
-    --progress-smoothing-window 1 \
-    --failure-min-progress-gain 0.05 \
-    --failure-low-success-duration 2 \
-    --failure-success-threshold 0.2 \
+    --success-threshold 0.5 \
     --max-frames 8 \
     --monitor-interval 1.0
 
