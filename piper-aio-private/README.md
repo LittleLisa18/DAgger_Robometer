@@ -453,6 +453,33 @@ Additional teacher/student options:
 
 During inference, press `SPACE` to enter interactive mode, then press `s` to switch to the student policy or `t` to switch to the teacher policy. The current queued chunk is discarded after a policy switch, so the next published action comes from a fresh inference call to the selected policy.
 
+For automatic failure-triggered Teacher takeover, run both policies with their own
+Robometer dashboard/API ports, then use:
+
+```bash
+python inference/infer_teacher_dagger_ensemble.py \
+  --task towel \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --student_dashboard_port 8080 \
+  --teacher_host 127.0.0.1 \
+  --teacher_port 8001 \
+  --teacher_dashboard_port 8081 \
+  --teacher_success_duration 5 \
+  --save_rollout \
+  --save_dir ~/data
+```
+
+Each episode starts with Student. Its first Robometer failure stops the arms,
+invalidates queued/in-flight Student actions, resets the Teacher Robometer, and
+switches to a fresh Teacher chunk. Teacher failure discards the complete episode.
+Teacher success must remain positive in new Robometer samples for
+`--teacher_success_duration` seconds; it then stops the arms and automatically
+saves the combined Student/Teacher episode when `--save_rollout` is enabled.
+After either outcome, the arms return to the configured initial pose and the
+program waits for Enter before the next instruction. The two monitored policy
+servers must not share a dashboard port when they run on the same host.
+
 #### Asynchronous Inference
 
 ```bash

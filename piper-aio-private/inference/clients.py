@@ -197,6 +197,17 @@ class OpenpiClient:
         self._failure_latched = True
         return True
 
+    def get_robometer_state(self, timeout: float = 0.2) -> dict | None:
+        """Return the live Robometer dashboard state, or None when unavailable."""
+        if self.dashboard_state_url is None:
+            return None
+        try:
+            with urllib.request.urlopen(self.dashboard_state_url, timeout=timeout) as response:
+                return json.loads(response.read())
+        except Exception:
+            # Monitoring availability must never interrupt robot control.
+            return None
+
     def _build_observation(self, payload) -> dict:
         images = [payload["top"], payload["left"], payload["right"]]
         if self.preview is not None:

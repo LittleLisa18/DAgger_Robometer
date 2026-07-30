@@ -297,12 +297,13 @@ class StreamActionBuffer:
             return action
 
 
-def build_openpi_policy(host, port, args, config):
+def build_openpi_policy(host, port, dashboard_port, args, config):
     return OpenpiClient(
         host=host,
         port=port,
         image_size=args.image_size,
         prompt=config["language_instruction"],
+        dashboard_port=dashboard_port,
     )
 
 
@@ -313,8 +314,12 @@ def build_policy_switcher(args, config):
         raise ValueError(f"Unknown teacher model: {args.teacher_model}")
 
     teacher_host = args.teacher_host if args.teacher_host is not None else args.host
-    student_policy = build_openpi_policy(args.host, args.port, args, config)
-    teacher_policy = build_openpi_policy(teacher_host, args.teacher_port, args, config)
+    student_policy = build_openpi_policy(
+        args.host, args.port, args.student_dashboard_port, args, config
+    )
+    teacher_policy = build_openpi_policy(
+        teacher_host, args.teacher_port, args.teacher_dashboard_port, args, config
+    )
     return PolicySwitcher(student_policy, teacher_policy, args.initial_policy)
 
 
@@ -417,6 +422,111 @@ def start_inference_thread(args, config, policy_switcher, ros_operator, action_b
     inference_thread.start()
 
 
+class AutomaticRobometerMonitor:
+    """Stop the robot on failure and confirm sustained Teacher success."""
+
+    def __init__(
+        self,
+        policy_switcher,
+        ros_operator,
+        command_lock,
+        success_duration,
+        poll_interval=0.05,
+    ):
+        self.policy_switcher = policy_switcher
+        self.ros_operator = ros_operator
+        self.command_lock = command_lock
+        self.success_duration = success_duration
+        self.poll_interval = poll_interval
+        self.failure_event = threading.Event()
+        self.success_event = threading.Event()
+        self.stop_event = threading.Event()
+        self._lock = threading.Lock()
+        self._phase = "idle"
+        self._failure_phase = None
+        self._success_started_at = None
+        self._last_sample_time = None
+        self.thread = threading.Thread(
+            target=self._run, name="automatic-robometer-monitor", daemon=True
+        )
+
+    def start(self):
+        self.thread.start()
+
+    def stop(self):
+        self.stop_event.set()
+        self.thread.join(timeout=1.0)
+
+    def set_phase(self, phase):
+        if phase not in {"idle", "student", "teacher"}:
+            raise ValueError(f"Unknown automatic monitor phase: {phase}")
+        with self._lock:
+            self._phase = phase
+            self._failure_phase = None
+            self._success_started_at = None
+            self._last_sample_time = None
+            self.failure_event.clear()
+            self.success_event.clear()
+
+    def consume_failure(self):
+        if not self.failure_event.is_set():
+            return None
+        with self._lock:
+            phase = self._failure_phase
+            self.failure_event.clear()
+            return phase
+
+    def _run(self):
+        while not self.stop_event.is_set() and not shutdown_event.is_set():
+            with self._lock:
+                phase = self._phase
+            if phase == "idle":
+                self.stop_event.wait(self.poll_interval)
+                continue
+
+            policy = self.policy_switcher.policies[phase]
+            state = policy.get_robometer_state(timeout=min(0.2, self.poll_interval * 2))
+            if state is None:
+                self.stop_event.wait(self.poll_interval)
+                continue
+
+            if bool(state.get("failure", False)):
+                # Publish loop checks this event while holding the same lock. No
+                # action can be published after the failure hold is requested.
+                with self._lock:
+                    if self._phase != phase:
+                        continue
+                    self._failure_phase = phase
+                    self.failure_event.set()
+                    self._phase = "idle"
+                with self.command_lock:
+                    self.ros_operator.stop_follower_arms()
+                print(f"\n\033[31mRobometer detected {phase.upper()} FAILURE; robot stopped.\033[0m")
+                continue
+
+            if phase == "teacher":
+                samples = state.get("samples") or []
+                if samples:
+                    latest = samples[-1]
+                    sample_time = float(latest.get("time", 0.0))
+                    if sample_time != self._last_sample_time:
+                        self._last_sample_time = sample_time
+                        if bool(latest.get("success", False)):
+                            if self._success_started_at is None:
+                                self._success_started_at = sample_time
+                            if sample_time - self._success_started_at >= self.success_duration:
+                                self.success_event.set()
+                        else:
+                            self._success_started_at = None
+
+            self.stop_event.wait(self.poll_interval)
+
+
+def reset_robot_for_next_episode(ros_operator, left0, right0):
+    ros_operator.stop_follower_arms()
+    ros_operator.follower_arm_publish_continuous(left0, right0)
+
+
 def model_inference(args, config, ros_operator):
     global inference_stamp
 
@@ -440,7 +550,9 @@ def model_inference(args, config, ros_operator):
     policy_switcher.policies["teacher"].warmup()
     print("Teacher policy server warmed up")
 
-    print(f"Initial active policy: {policy_switcher.active_name}")
+    if policy_switcher.active_name != "student":
+        policy_switcher.switch_to("student")
+    print("Automatic DAgger mode: each episode starts with the student policy")
 
     input("Press enter to continue")
     task_time = time.time()
@@ -453,6 +565,15 @@ def model_inference(args, config, ros_operator):
     )
     start_inference_thread(args, config, policy_switcher, ros_operator, action_buffer)
     recorder = InferenceDataRecorder(args, config, shutdown_event=shutdown_event)
+    command_lock = threading.Lock()
+    monitor = AutomaticRobometerMonitor(
+        policy_switcher,
+        ros_operator,
+        command_lock,
+        success_duration=args.teacher_success_duration,
+        poll_interval=args.robometer_poll_interval,
+    )
+    monitor.start()
 
     try:
         while not rospy.is_shutdown():
@@ -462,9 +583,18 @@ def model_inference(args, config, ros_operator):
             begin_new_episode(wait_timeout=5.0)
             reset_observation_window()
             action_buffer.reset()
+            recorder.reset()
+            if policy_switcher.active_name != "student":
+                policy_switcher.switch_to("student")
+            teacher_policy = policy_switcher.policies["teacher"]
+            student_policy = policy_switcher.policies["student"]
+            teacher_policy.standby_robometer()
+            if not student_policy.reset_episode():
+                raise RuntimeError("Could not reset the Student Robometer episode")
+            monitor.set_phase("student")
 
             inference_stamp = 0
-            episode_closed = False
+            episode_result = None
 
             actions = infer_active_chunk(args, config, policy_switcher, ros_operator)
             assert actions is not None, "Initial sync inference returned None"
@@ -473,6 +603,41 @@ def model_inference(args, config, ros_operator):
             last_valid_act = None
 
             while t < max_publish_step and not rospy.is_shutdown() and not shutdown_event.is_set():
+                failure_phase = monitor.consume_failure()
+                if failure_phase == "student":
+                    print("\033[33mSwitching automatically from Student to Teacher...\033[0m")
+                    monitor.set_phase("idle")
+                    inference_paused.clear()
+                    begin_new_episode(wait_timeout=5.0)
+                    policy_switcher.switch_to("teacher")
+                    action_buffer.reset()
+                    reset_observation_window()
+                    last_valid_act = None
+                    if not teacher_policy.reset_episode():
+                        episode_result = "discard"
+                        rospy.logerr("Teacher Robometer reset failed; discarding episode")
+                        break
+                    monitor.set_phase("teacher")
+                    actions = infer_active_chunk(args, config, policy_switcher, ros_operator)
+                    if actions is None or monitor.failure_event.is_set():
+                        episode_result = "discard"
+                        break
+                    action_buffer.integrate_first_chunk(actions[:chunk_size])
+                    continue
+                if failure_phase == "teacher":
+                    print("\033[31mTeacher also failed; discarding this episode.\033[0m")
+                    episode_result = "discard"
+                    break
+                if monitor.success_event.is_set():
+                    with command_lock:
+                        ros_operator.stop_follower_arms()
+                    print(
+                        f"\033[32mTeacher success sustained for "
+                        f"{args.teacher_success_duration:.1f}s; episode complete.\033[0m"
+                    )
+                    episode_result = "success"
+                    break
+
                 print(
                     f"[Step {t:4d}] policy={policy_switcher.active_name} | k={action_buffer.k:3d} | "
                     f"cur_chunk={len(action_buffer.cur_chunk):3d} | epoch={action_buffer.epoch:3d}"
@@ -482,23 +647,34 @@ def model_inference(args, config, ros_operator):
                     inference_paused.clear()
                     result, policy_changed = handle_interactive_mode(task_time, policy_switcher=policy_switcher)
                     if result == "reset":
-                        recorder.save_episode()
-                        episode_closed = True
-                        ros_operator.follower_arm_publish_continuous(left0, right0)
+                        recorder.discard_episode()
+                        episode_result = "discard"
                         if policy_switcher.active_name != "student":
                             policy_switcher.switch_to("student")
-                        input("Press enter to continue")
-                        task_time = time.time()
                         break
                     if result == "quit":
-                        recorder.save_episode()
+                        recorder.discard_episode()
                         return
                     if policy_changed:
+                        # Keep the manual override safe and consistent with the
+                        # automatic path: stop, invalidate stale inference, and
+                        # monitor the newly selected policy's own dashboard.
+                        monitor.set_phase("idle")
                         inference_paused.clear()
+                        with command_lock:
+                            ros_operator.stop_follower_arms()
+                        begin_new_episode(wait_timeout=5.0)
                         action_buffer.reset()
+                        reset_observation_window()
                         last_valid_act = None
+                        active_name = policy_switcher.active_name
+                        if not policy_switcher.active_policy.reset_episode():
+                            episode_result = "discard"
+                            break
+                        monitor.set_phase(active_name)
                         actions = infer_active_chunk(args, config, policy_switcher, ros_operator)
-                        if actions is None:
+                        if actions is None or monitor.failure_event.is_set():
+                            episode_result = "discard"
                             break
                         action_buffer.integrate_first_chunk(actions[:chunk_size])
 
@@ -528,11 +704,17 @@ def model_inference(args, config, ros_operator):
                 if args.ctrl_type == "joint":
                     left_action, right_action = process_action(config["task"], act)
                     action_to_save = np.concatenate((left_action, right_action), axis=0)
-                    ros_operator.follower_arm_publish(left_action, right_action)
+                    with command_lock:
+                        if monitor.failure_event.is_set() or monitor.success_event.is_set():
+                            continue
+                        ros_operator.follower_arm_publish(left_action, right_action)
                 elif args.ctrl_type == "eef":
                     left_action, right_action = process_action(config["task"], act)
                     action_to_save = np.concatenate((left_action, right_action), axis=0)
-                    ros_operator.follower_arm_pose_publish(left_action, right_action)
+                    with command_lock:
+                        if monitor.failure_event.is_set() or monitor.success_event.is_set():
+                            continue
+                        ros_operator.follower_arm_pose_publish(left_action, right_action)
                 else:
                     raise ValueError(f"Unknown ctrl_type: {args.ctrl_type}")
 
@@ -546,11 +728,22 @@ def model_inference(args, config, ros_operator):
                 print(f"Published Step {t} with {policy_name} policy")
                 rate.sleep()
 
-            if not episode_closed:
-                recorder.save_episode()
+            monitor.set_phase("idle")
+            inference_paused.clear()
+            begin_new_episode(wait_timeout=5.0)
+            if episode_result == "success":
+                recorder.save_episode(require_confirmation=False)
+            else:
+                if episode_result is None:
+                    print("\033[31mEpisode limit reached without confirmed Teacher success; discarding.\033[0m")
+                recorder.discard_episode()
+            reset_robot_for_next_episode(ros_operator, left0, right0)
             if shutdown_event.is_set():
                 return
+            input("Episode reset. Press enter to start the next instruction")
+            task_time = time.time()
     finally:
+        monitor.stop()
         ros_operator.follower_arm_publish_continuous(left0, right0)
 
 
@@ -563,6 +756,15 @@ def validate_args(args, parser):
         parser.error("--delay, --exec_horizon, and --chunk_size must satisfy 0 <= delay <= exec_horizon <= chunk_size")
     if args.min_smooth_steps < 1:
         parser.error("--min_smooth_steps must be greater than or equal to 1")
+    if args.teacher_success_duration <= 0:
+        parser.error("--teacher_success_duration must be greater than 0")
+    if args.robometer_poll_interval <= 0:
+        parser.error("--robometer_poll_interval must be greater than 0")
+    if args.student_dashboard_port <= 0 or args.teacher_dashboard_port <= 0:
+        parser.error("Robometer dashboard ports must be greater than 0")
+    teacher_host = args.teacher_host if args.teacher_host is not None else args.host
+    if args.host == teacher_host and args.student_dashboard_port == args.teacher_dashboard_port:
+        parser.error("Student and Teacher dashboard ports must differ when both servers use the same host")
 
 
 def get_arguments():
@@ -770,6 +972,30 @@ def get_arguments():
         help="Teacher websocket server port",
         default=8001,
         required=False,
+    )
+    parser.add_argument(
+        "--student_dashboard_port",
+        type=int,
+        help="Student Robometer dashboard/API port",
+        default=8080,
+    )
+    parser.add_argument(
+        "--teacher_dashboard_port",
+        type=int,
+        help="Teacher Robometer dashboard/API port",
+        default=8081,
+    )
+    parser.add_argument(
+        "--teacher_success_duration",
+        type=float,
+        help="Seconds of continuous Robometer success required to finish a Teacher rollout",
+        default=5.0,
+    )
+    parser.add_argument(
+        "--robometer_poll_interval",
+        type=float,
+        help="Seconds between Robometer state checks",
+        default=0.05,
     )
     parser.add_argument(
         "--image_size",

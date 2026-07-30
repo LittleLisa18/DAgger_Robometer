@@ -501,7 +501,12 @@ class InferenceDataRecorder:
                 return key
         return "q"
 
-    def save_episode(self):
+    def discard_episode(self):
+        if self.enabled and self.actions:
+            print(f"\033[31m\nEpisode discarded. {len(self.actions)} frames thrown away.\033[0m")
+        self.reset()
+
+    def save_episode(self, require_confirmation=True):
         if not self.enabled:
             return
         if len(self.actions) == 0:
@@ -511,9 +516,8 @@ class InferenceDataRecorder:
 
         print("len(timesteps): ", len(self.timesteps))
         print("len(actions)  : ", len(self.actions))
-        if self.wait_save_choice() != "s":
-            print(f"\033[31m\nEpisode discarded. {len(self.actions)} frames thrown away.\033[0m")
-            self.reset()
+        if require_confirmation and self.wait_save_choice() != "s":
+            self.discard_episode()
             return
 
         dataset_path = os.path.join(self.save_dir, f"episode_{self.episode_idx}")
