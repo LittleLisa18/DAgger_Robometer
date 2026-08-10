@@ -91,7 +91,7 @@ insert:
   right0: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.2]
 
 pick_pen:
-  language_instruction: "Pick up the pens and place them in the yellow cup."
+  language_instruction: "pick up the scattered pens one by one and place them in the yellow cup"
   left0: *default_left0
   right0: *default_right0
 
