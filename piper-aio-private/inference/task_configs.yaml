@@ -90,6 +90,11 @@ insert:
   left0: [0.0, -0.04, 0.04, 0.76, 0.0, 0.0, 0]
   right0: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.2]
 
+pick_pen:
+  language_instruction: "Pick up the pens and place them in the yellow cup."
+  left0: *default_left0
+  right0: *default_right0
+
 fold_dishcloth:
   language_instruction: "fold the dishcloth in half twice, then place it in the position slightly to the front and left"
   left0: *default_left0

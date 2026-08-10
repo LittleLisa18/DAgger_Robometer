@@ -12,6 +12,7 @@ exec python inference/infer_teacher_dagger_ensemble.py \
   --teacher_port 8003 \
   --teacher_dashboard_port 8081 \
   --ctrl_type joint \
+  --student_success_duration 5 \
   --teacher_success_duration 5 \
   --robometer_poll_interval 0.05 \
   --save_rollout \

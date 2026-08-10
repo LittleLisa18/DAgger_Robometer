@@ -430,13 +430,17 @@ class AutomaticRobometerMonitor:
         policy_switcher,
         ros_operator,
         command_lock,
-        success_duration,
+        student_success_duration,
+        teacher_success_duration,
         poll_interval=0.05,
     ):
         self.policy_switcher = policy_switcher
         self.ros_operator = ros_operator
         self.command_lock = command_lock
-        self.success_duration = success_duration
+        self.success_durations = {
+            "student": student_success_duration,
+            "teacher": teacher_success_duration,
+        }
         self.poll_interval = poll_interval
         self.failure_event = threading.Event()
         self.success_event = threading.Event()
@@ -444,6 +448,7 @@ class AutomaticRobometerMonitor:
         self._lock = threading.Lock()
         self._phase = "idle"
         self._failure_phase = None
+        self._success_phase = None
         self._success_started_at = None
         self._last_sample_time = None
         self.thread = threading.Thread(
@@ -463,6 +468,7 @@ class AutomaticRobometerMonitor:
         with self._lock:
             self._phase = phase
             self._failure_phase = None
+            self._success_phase = None
             self._success_started_at = None
             self._last_sample_time = None
             self.failure_event.clear()
@@ -474,6 +480,14 @@ class AutomaticRobometerMonitor:
         with self._lock:
             phase = self._failure_phase
             self.failure_event.clear()
+            return phase
+
+    def consume_success(self):
+        if not self.success_event.is_set():
+            return None
+        with self._lock:
+            phase = self._success_phase
+            self.success_event.clear()
             return phase
 
     def _run(self):
@@ -504,20 +518,25 @@ class AutomaticRobometerMonitor:
                 print(f"\n\033[31mRobometer detected {phase.upper()} FAILURE; robot stopped.\033[0m")
                 continue
 
-            if phase == "teacher":
-                samples = state.get("samples") or []
-                if samples:
-                    latest = samples[-1]
-                    sample_time = float(latest.get("time", 0.0))
-                    if sample_time != self._last_sample_time:
-                        self._last_sample_time = sample_time
-                        if bool(latest.get("success", False)):
-                            if self._success_started_at is None:
-                                self._success_started_at = sample_time
-                            if sample_time - self._success_started_at >= self.success_duration:
-                                self.success_event.set()
-                        else:
-                            self._success_started_at = None
+            samples = state.get("samples") or []
+            if samples:
+                latest = samples[-1]
+                sample_time = float(latest.get("time", 0.0))
+                if sample_time != self._last_sample_time:
+                    self._last_sample_time = sample_time
+                    if bool(latest.get("success", False)):
+                        if self._success_started_at is None:
+                            self._success_started_at = sample_time
+                        if sample_time - self._success_started_at >= self.success_durations[phase]:
+                            with self._lock:
+                                if self._phase == phase:
+                                    self._success_phase = phase
+                                    self.success_event.set()
+                                    self._phase = "idle"
+                            with self.command_lock:
+                                self.ros_operator.stop_follower_arms()
+                    else:
+                        self._success_started_at = None
 
             self.stop_event.wait(self.poll_interval)
 
@@ -570,7 +589,8 @@ def model_inference(args, config, ros_operator):
         policy_switcher,
         ros_operator,
         command_lock,
-        success_duration=args.teacher_success_duration,
+        student_success_duration=args.student_success_duration,
+        teacher_success_duration=args.teacher_success_duration,
         poll_interval=args.robometer_poll_interval,
     )
     monitor.start()
@@ -628,9 +648,15 @@ def model_inference(args, config, ros_operator):
                     print("\033[31mTeacher also failed; discarding this episode.\033[0m")
                     episode_result = "discard"
                     break
-                if monitor.success_event.is_set():
-                    with command_lock:
-                        ros_operator.stop_follower_arms()
+                success_phase = monitor.consume_success()
+                if success_phase == "student":
+                    print(
+                        f"\033[32mStudent success sustained for "
+                        f"{args.student_success_duration:.1f}s; discarding this non-DAgger episode.\033[0m"
+                    )
+                    episode_result = "discard"
+                    break
+                if success_phase == "teacher":
                     print(
                         f"\033[32mTeacher success sustained for "
                         f"{args.teacher_success_duration:.1f}s; episode complete.\033[0m"
@@ -758,6 +784,8 @@ def validate_args(args, parser):
         parser.error("--min_smooth_steps must be greater than or equal to 1")
     if args.teacher_success_duration <= 0:
         parser.error("--teacher_success_duration must be greater than 0")
+    if args.student_success_duration <= 0:
+        parser.error("--student_success_duration must be greater than 0")
     if args.robometer_poll_interval <= 0:
         parser.error("--robometer_poll_interval must be greater than 0")
     if args.student_dashboard_port <= 0 or args.teacher_dashboard_port <= 0:
@@ -984,6 +1012,12 @@ def get_arguments():
         type=int,
         help="Teacher Robometer dashboard/API port",
         default=8081,
+    )
+    parser.add_argument(
+        "--student_success_duration",
+        type=float,
+        help="Seconds of continuous Robometer success that end and discard a Student-only rollout",
+        default=5.0,
     )
     parser.add_argument(
         "--teacher_success_duration",

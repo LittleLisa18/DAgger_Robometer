@@ -465,12 +465,14 @@ python inference/infer_teacher_dagger_ensemble.py \
   --teacher_host 127.0.0.1 \
   --teacher_port 8001 \
   --teacher_dashboard_port 8081 \
+  --student_success_duration 5 \
   --teacher_success_duration 5 \
   --save_rollout \
   --save_dir ~/data
 ```
 
-Each episode starts with Student. Its first Robometer failure stops the arms,
+Each episode starts with Student. Sustained Student success ends and discards the
+non-DAgger episode. Its first Robometer failure stops the arms,
 invalidates queued/in-flight Student actions, resets the Teacher Robometer, and
 switches to a fresh Teacher chunk. Teacher failure discards the complete episode.
 Teacher success must remain positive in new Robometer samples for

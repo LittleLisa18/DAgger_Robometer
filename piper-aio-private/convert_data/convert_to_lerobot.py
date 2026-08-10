@@ -27,7 +27,7 @@ from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 # INSTRUCTION = "Pick up the cup that contains the hidden object after the shuffles."
 # INSTRUCTION = "Pick up the rolling bottle."
 # INSTRUCTION = "Insert the pen from one bottle into another bottle."
-INSTRUCTION = "fold the dishcloth in half twice, then place it in the position slightly to the front and left"
+INSTRUCTION = "Pick up the pens and place them in the yellow cup."
 DEFAULT_COLLECT = "teleop"
 
 
