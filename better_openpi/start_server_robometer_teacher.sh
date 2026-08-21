@@ -1,5 +1,5 @@
 #!/bin/bash
-TEACHER_CHECKPOINT="${1:-/path/to/teacher/checkpoint/49999}"
+TEACHER_CHECKPOINT="${1:-/media/sail/jinghua4T/ckpt_yantong/pi05_fold_dishcloth_0716/49999}"
 
 XLA_PYTHON_CLIENT_MEM_FRACTION=0.45 \
 uv run scripts/serve_policy_with_robometer.py \
@@ -9,7 +9,7 @@ uv run scripts/serve_policy_with_robometer.py \
   --robometer-url http://127.0.0.1:8002 \
   --dashboard-port 8081 \
   --camera cam_high \
-  --failure-timeout 4 \
+  --failure-timeout 16 \
   --success-threshold 0.5 \
   --max-frames 8 \
   --monitor-interval 1.0 \

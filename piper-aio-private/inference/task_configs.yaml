@@ -94,6 +94,9 @@ pick_pen:
   language_instruction: "pick up the scattered pens one by one and place them in the yellow cup"
   left0: *default_left0
   right0: *default_right0
+  action_postprocess:
+    fix_arms_to_initial_pose: [left]
+    fix_arms_to_initial_pose_targets: [action]
 
 fold_dishcloth:
   language_instruction: "fold the dishcloth in half twice, then place it in the position slightly to the front and left"

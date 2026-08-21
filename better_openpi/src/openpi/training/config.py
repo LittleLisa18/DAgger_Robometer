@@ -1244,7 +1244,7 @@ _CONFIGS = [
         data=LeRobotAgilexDataConfig(
             repo_id="/houzhi_vepfs/luyuxiang/dataset/lerobot/fold_dishcloth_0623",
             base_config=DataConfig(prompt_from_task=True),
-            assets=AssetsConfig(asset_id="fold_dishcloth_0623_0716"),
+            assets=AssetsConfig(asset_id="fold_dishcloth_0623"),
         ),
         batch_size=128,
         num_workers=8,
@@ -1473,16 +1473,16 @@ _CONFIGS = [
         name="pi05_distill_agilex",
         model=pi0_config.Pi0Config(pi05=True),
         data=LeRobotAgilexDataConfig(
-            repo_id="/houzhi_vepfs/luyuxiang/dataset/lerobot/fold_dishcloth_0515",
+            repo_id="/houzhi_vepfs/luyuxiang/dataset/lerobot/fold_dishcloth_0716",
             base_config=DataConfig(prompt_from_task=True),
-            assets=AssetsConfig(asset_id="fold_dishcloth_0515"),
+            assets=AssetsConfig(asset_id="fold_dishcloth_0716"),
         ),
         # Student is initialized from the VLM base weights.
         weight_loader=weight_loaders.PaliGemmaWeightLoader(),
         distill_config=DistillConfig(
             # Path to the fine-tuned teacher checkpoint params directory.
-            teacher_checkpoint="checkpoints/pi05_agilex/pi05_fold_dishcloth_0515/49999/params",
-            vit_weight=1.0,
+            teacher_checkpoint="checkpoints/pi05_agilex/pi05_fold_dishcloth_0716/49999/params",
+            vit_weight=0.0,
             llm_weight=0.0,
             flow_weight=1.0,
             gt_weight=1.0,
