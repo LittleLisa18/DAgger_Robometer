@@ -24,6 +24,19 @@ from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 LOGGER = logging.getLogger(__name__)
 
 
+def _load_smolvla_config(checkpoint: str, *, local_files_only: bool) -> Any:
+    """Load a policy config through LeRobot's type-aware config registry."""
+    from lerobot.configs.policies import PreTrainedConfig
+    from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
+
+    config = PreTrainedConfig.from_pretrained(checkpoint, local_files_only=local_files_only)
+    if not isinstance(config, SmolVLAConfig):
+        raise ValueError(
+            f"Expected a SmolVLA checkpoint, got policy type {config.type!r} from {checkpoint!r}"
+        )
+    return config
+
+
 def _pack_numpy(value: Any) -> Any:
     """Encode NumPy values exactly as ``openpi_client.msgpack_numpy`` does."""
     if isinstance(value, (np.ndarray, np.generic)) and value.dtype.kind in ("V", "O", "c"):
@@ -105,14 +118,13 @@ class SmolVLAPiperAdapter:
         # Keep model imports lazy so protocol tooling can run without loading the
         # complete transformers stack.
         from lerobot.policies.factory import make_pre_post_processors
-        from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
         from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 
         self.checkpoint = checkpoint
         self.device = _resolve_device(device)
         self.keys = PiperObservationKeys()
 
-        config = SmolVLAConfig.from_pretrained(checkpoint, local_files_only=local_files_only)
+        config = _load_smolvla_config(checkpoint, local_files_only=local_files_only)
         config.device = self.device
         self.policy = SmolVLAPolicy.from_pretrained(
             checkpoint,

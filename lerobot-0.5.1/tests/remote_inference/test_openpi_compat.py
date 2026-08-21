@@ -6,7 +6,12 @@ import numpy as np
 import pytest
 import torch
 
-from lerobot.remote_inference.openpi_compat import SmolVLAPiperAdapter, pack_message, unpack_message
+from lerobot.remote_inference.openpi_compat import (
+    SmolVLAPiperAdapter,
+    _load_smolvla_config,
+    pack_message,
+    unpack_message,
+)
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 
 
@@ -21,6 +26,16 @@ def test_message_codec_matches_numpy_shapes_and_dtypes() -> None:
     np.testing.assert_array_equal(decoded["image"], value["image"])
     assert decoded["scalar"] == np.int64(7)
     assert decoded["state"].dtype == np.float32
+
+
+def test_load_config_accepts_saved_smolvla_type_field(tmp_path) -> None:
+    from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
+
+    SmolVLAConfig().save_pretrained(tmp_path)
+
+    config = _load_smolvla_config(str(tmp_path), local_files_only=True)
+
+    assert isinstance(config, SmolVLAConfig)
 
 
 class _FakePolicy:
