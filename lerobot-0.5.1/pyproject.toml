@@ -91,6 +91,8 @@ dependencies = [
     "deepdiff>=7.0.1,<9.0.0",
     "imageio[ffmpeg]>=2.34.0,<3.0.0",
     "termcolor>=2.4.0,<4.0.0",
+    "msgpack>=1.0.8,<2.0.0",
+    "websockets>=15.0,<17.0",
 ]
 
 # Optional dependencies
@@ -228,6 +230,7 @@ lerobot-find-joint-limits="lerobot.scripts.lerobot_find_joint_limits:main"
 lerobot-imgtransform-viz="lerobot.scripts.lerobot_imgtransform_viz:main"
 lerobot-edit-dataset="lerobot.scripts.lerobot_edit_dataset:main"
 lerobot-setup-can="lerobot.scripts.lerobot_setup_can:main"
+lerobot-serve-smolvla-piper="lerobot.scripts.lerobot_serve_smolvla_piper:main"
 
 # ---------------- Tool Configurations ----------------
 [tool.setuptools.package-data]

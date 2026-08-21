@@ -63,6 +63,8 @@
 - sections:
   - local: async
     title: Use Async Inference
+  - local: smolvla_piper_inference
+    title: Serve SmolVLA to Piper
   - local: rtc
     title: Real-Time Chunking (RTC)
   title: "Inference"

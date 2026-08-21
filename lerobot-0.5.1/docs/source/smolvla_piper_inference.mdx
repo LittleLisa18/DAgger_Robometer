@@ -1,0 +1,54 @@
+# SmolVLA remote inference for Piper
+
+This endpoint lets the existing `piper-aio-private` inference program control the
+robot with a SmolVLA checkpoint. It implements the same WebSocket and MessagePack
+contract as OpenPI, so no Piper source changes are required.
+
+## Start the SmolVLA server
+
+Run this in the LeRobot environment on the policy machine:
+
+```bash
+PYTHONPATH=src python -m lerobot.scripts.lerobot_serve_smolvla_piper \
+  --checkpoint /path/to/smolvla/checkpoints/last/pretrained_model \
+  --device cuda \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --actions-per-chunk 50 \
+  --local-files-only
+```
+
+This command uses the active Python environment directly and does not require
+`uv`. If LeRobot is already installed in that environment (for example with
+`pip install -e .`), the `PYTHONPATH=src` prefix may be omitted.
+
+The checkpoint must use the AgileX features from the training dataset:
+
+- `observation.state`: 14 values
+- `observation.images.cam_high`
+- `observation.images.cam_left_wrist`
+- `observation.images.cam_right_wrist`
+- `action`: 14 values
+
+The server validates these features at startup. It converts Piper's CHW `uint8`
+images to the normalized tensors expected by SmolVLA, runs the checkpoint's saved
+preprocessor and postprocessor, and returns an absolute action chunk with shape
+`[T, 14]`.
+
+## Start the unchanged Piper client
+
+Use the same command and `openpi` model setting that you already use for the OpenPI
+server. Point `--host` and `--port` at the SmolVLA server above. For example:
+
+```bash
+python inference/infer_sync.py \
+  --task pick_pen \
+  --model openpi \
+  --host POLICY_SERVER_IP \
+  --port 8000 \
+  --chunk_size 50
+```
+
+Keep Piper's `--chunk_size` no larger than the server's
+`--actions-per-chunk`. The robot-side safety limits and action publishing remain
+owned by the existing Piper process.

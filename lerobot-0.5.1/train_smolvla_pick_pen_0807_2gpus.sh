@@ -15,7 +15,7 @@ export TMPDIR=/tmp/yantong_tmp
 mkdir -p "$TMPDIR"
 chmod 700 "$TMPDIR"
 
-export WANDB_API_KEY="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"
+: "${WANDB_API_KEY:?Set WANDB_API_KEY before starting training}"
 
 # activate conda
 cd /home/ma-user/work/users/yantong
