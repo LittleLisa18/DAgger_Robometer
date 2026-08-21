@@ -1242,9 +1242,9 @@ _CONFIGS = [
         name="pi05_agilex",
         model=pi0_config.Pi0Config(pi05=True),
         data=LeRobotAgilexDataConfig(
-            repo_id="/houzhi_vepfs/luyuxiang/dataset/lerobot/fold_dishcloth_0623",
+            repo_id="/home/ma-user/work/users/yantong/data/pick_pen_0807",
             base_config=DataConfig(prompt_from_task=True),
-            assets=AssetsConfig(asset_id="fold_dishcloth_0623_0716"),
+            assets=AssetsConfig(asset_id="pick_pen_0807"),
         ),
         batch_size=128,
         num_workers=8,
@@ -1284,9 +1284,9 @@ _CONFIGS = [
         name="pi05_vlm_agilex",
         model=pi0_config.Pi0Config(pi05=True),
         data=LeRobotAgilexDataConfig(
-            repo_id="/data/luyuxiang/lerobot/test/pick_beverage_408_fix",
+            repo_id="/home/ma-user/work/users/yantong/data/pick_pen_0807",
             base_config=DataConfig(prompt_from_task=True),
-            assets=AssetsConfig(asset_id="fold_dishcloth_0716"),
+            assets=AssetsConfig(asset_id="pick_pen_0807"),
         ),
         batch_size=128,
         num_workers=8,
