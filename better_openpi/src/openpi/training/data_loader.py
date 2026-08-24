@@ -19,6 +19,11 @@ import openpi.transforms as _transforms
 T_co = TypeVar("T_co", covariant=True)
 
 
+_VALID_COLLECT_LABELS = frozenset({"teleop", "teacher", "rollout", "dagger"})
+_NON_ROLLOUT_COLLECT_LABELS = _VALID_COLLECT_LABELS - {"rollout"}
+DISTILL_GT_MASK_KEY = "distill_gt_mask"
+
+
 class Dataset(Protocol[T_co]):
     """Interface for a dataset with random access."""
 
@@ -51,15 +56,249 @@ class DataLoader(Protocol[T_co]):
 
 
 class TransformedDataset(Dataset[T_co]):
-    def __init__(self, dataset: Dataset, transforms: Sequence[_transforms.DataTransformFn]):
+    def __init__(
+        self,
+        dataset: Dataset,
+        transforms: Sequence[_transforms.DataTransformFn],
+        *,
+        preserve_keys: Sequence[str] = (),
+    ):
         self._dataset = dataset
         self._transform = _transforms.compose(transforms)
+        self._preserve_keys = tuple(preserve_keys)
 
     def __getitem__(self, index: SupportsIndex) -> T_co:
-        return self._transform(self._dataset[index])
+        item = self._dataset[index]
+        preserved = {key: item[key] for key in self._preserve_keys}
+        transformed = self._transform(item)
+        return {**transformed, **preserved}
 
     def __len__(self) -> int:
         return len(self._dataset)
+
+
+class FullActionChunkLeRobotDataset(Dataset[T_co]):
+    """Filters LeRobot samples by action-chunk validity and, optionally, current-frame collect label."""
+
+    def __init__(
+        self,
+        dataset: Dataset[T_co],
+        action_horizon: int,
+        *,
+        pad_at_episode_end: bool = False,
+        allowed_collect_labels: frozenset[str] | None = None,
+    ):
+        self._dataset = dataset
+        self._indices = (
+            list(range(len(dataset)))
+            if pad_at_episode_end
+            else _valid_full_action_chunk_indices(dataset, action_horizon)
+        )
+        self._gt_masks: list[bool] | None = None
+        if allowed_collect_labels is not None:
+            collect_labels = _read_and_validate_collect_labels(dataset)
+            self._indices = [index for index in self._indices if collect_labels[index] in allowed_collect_labels]
+            self._gt_masks = [collect_labels[index] != "rollout" for index in self._indices]
+
+    def __getitem__(self, index: SupportsIndex) -> T_co:
+        logical_index = index.__index__()
+        item = self._dataset[self._indices[logical_index]]
+        if self._gt_masks is None:
+            return item
+        return {**item, DISTILL_GT_MASK_KEY: np.asarray(self._gt_masks[logical_index], dtype=np.bool_)}
+
+    def __len__(self) -> int:
+        return len(self._indices)
+
+    @property
+    def num_frames(self) -> int:
+        return len(self)
+
+    def __getattr__(self, name: str):
+        try:
+            dataset = object.__getattribute__(self, "_dataset")
+        except AttributeError as exc:
+            raise AttributeError(name) from exc
+        return getattr(dataset, name)
+
+
+class _DatasetSize:
+    def __init__(self, num_frames: int):
+        self.num_frames = num_frames
+
+
+class MultiLeRobotDatasetIndexFilter(Dataset[T_co]):
+    """Applies per-dataset action-chunk and collect-label filtering on a MultiLeRobotDataset."""
+
+    def __init__(
+        self,
+        dataset: lerobot_dataset.MultiLeRobotDataset,
+        action_horizon: int,
+        pad_at_episode_end: Sequence[bool],
+        *,
+        allowed_collect_labels: frozenset[str] | None = None,
+    ):
+        self._dataset = dataset
+        self.repo_ids = dataset.repo_ids
+        self._indices = []
+        self._datasets = []
+        self._gt_masks: list[bool] | None = [] if allowed_collect_labels is not None else None
+
+        original_offset = 0
+        for child_dataset, should_pad in zip(dataset._datasets, pad_at_episode_end, strict=True):  # noqa: SLF001
+            if should_pad:
+                local_indices = list(range(len(child_dataset)))
+            else:
+                local_indices = _valid_full_action_chunk_indices(child_dataset, action_horizon)
+            if allowed_collect_labels is not None:
+                collect_labels = _read_and_validate_collect_labels(child_dataset)
+                local_indices = [index for index in local_indices if collect_labels[index] in allowed_collect_labels]
+                self._gt_masks.extend(collect_labels[index] != "rollout" for index in local_indices)
+            self._indices.extend(original_offset + index for index in local_indices)
+            self._datasets.append(_DatasetSize(len(local_indices)))
+            original_offset += len(child_dataset)
+
+    def __getitem__(self, index: SupportsIndex) -> T_co:
+        logical_index = index.__index__()
+        item = self._dataset[self._indices[logical_index]]
+        if self._gt_masks is None:
+            return item
+        return {**item, DISTILL_GT_MASK_KEY: np.asarray(self._gt_masks[logical_index], dtype=np.bool_)}
+
+    def __len__(self) -> int:
+        return len(self._indices)
+
+    def __getattr__(self, name: str):
+        try:
+            dataset = object.__getattribute__(self, "_dataset")
+        except AttributeError as exc:
+            raise AttributeError(name) from exc
+        return getattr(dataset, name)
+
+
+def _as_int(value) -> int:
+    if hasattr(value, "item"):
+        return int(value.item())
+    return int(value)
+
+
+def _read_and_validate_collect_labels(dataset: Dataset) -> list[str]:
+    repo_id = getattr(dataset, "repo_id", "<unknown>")
+    hf_dataset = getattr(dataset, "hf_dataset", None)
+    features = getattr(hf_dataset, "features", {}) if hf_dataset is not None else {}
+    if hf_dataset is None or "collect" not in features:
+        raise ValueError(f"LeRobot dataset {repo_id!r} is missing required 'collect' feature for distillation.")
+
+    try:
+        raw_labels = hf_dataset["collect"]
+    except (KeyError, TypeError) as exc:
+        raise ValueError(
+            f"LeRobot dataset {repo_id!r} is missing required 'collect' feature for distillation."
+        ) from exc
+    if len(raw_labels) != len(dataset):
+        raise ValueError(
+            f"LeRobot dataset {repo_id!r} has {len(raw_labels)} collect labels for {len(dataset)} frames."
+        )
+
+    labels = []
+    invalid = set()
+    for value in raw_labels:
+        if isinstance(value, np.ndarray) and value.ndim == 0:
+            value = value.item()
+        label = value if isinstance(value, str) else None
+        if label not in _VALID_COLLECT_LABELS:
+            invalid.add(repr(value))
+        else:
+            labels.append(label)
+    if invalid:
+        raise ValueError(
+            f"LeRobot dataset {repo_id!r} has invalid collect labels {sorted(invalid)}; "
+            f"expected exactly {sorted(_VALID_COLLECT_LABELS)}."
+        )
+    return labels
+
+
+def _valid_full_action_chunk_indices(dataset: Dataset, action_horizon: int) -> list[int]:
+    if action_horizon <= 1:
+        return list(range(len(dataset)))
+    if not hasattr(dataset, "episode_data_index"):
+        raise ValueError("Cannot filter episode-end action chunks because the dataset has no episode_data_index.")
+
+    episode_data_index = dataset.episode_data_index
+    episodes = getattr(dataset, "episodes", None)
+    if episodes is None:
+        total_episodes = getattr(getattr(dataset, "meta", None), "total_episodes", None)
+        if total_episodes is None:
+            total_episodes = len(episode_data_index["from"])
+        episodes = range(total_episodes)
+
+    indices = []
+    for ep_idx in episodes:
+        ep_start = _as_int(episode_data_index["from"][ep_idx])
+        ep_end = _as_int(episode_data_index["to"][ep_idx])
+        last_start = ep_end - action_horizon
+        if last_start >= ep_start:
+            indices.extend(range(ep_start, last_start + 1))
+    return indices
+
+
+def _resolve_pad_at_episode_end(repo_id: str | list[str], value: bool | Sequence[bool] | dict[str, bool]):
+    if isinstance(repo_id, str):
+        if isinstance(value, dict):
+            return value.get(repo_id, True)
+        if isinstance(value, Sequence) and not isinstance(value, str | bytes):
+            if len(value) != 1:
+                raise ValueError("Single-dataset pad_at_episode_end must be a bool or a one-item list.")
+            return bool(value[0])
+        return bool(value)
+
+    if isinstance(value, dict):
+        missing = [dataset_id for dataset_id in repo_id if dataset_id not in value]
+        if missing:
+            raise ValueError(f"Missing pad_at_episode_end values for datasets: {missing}")
+        return [bool(value[dataset_id]) for dataset_id in repo_id]
+    if isinstance(value, Sequence) and not isinstance(value, str | bytes):
+        if len(value) != len(repo_id):
+            raise ValueError(
+                "Number of pad_at_episode_end values "
+                f"({len(value)}) must match number of repo_ids ({len(repo_id)})."
+            )
+        return [bool(v) for v in value]
+    return [bool(value) for _ in repo_id]
+
+
+def _filter_lerobot_episode_ends(
+    dataset: Dataset,
+    action_horizon: int,
+    *,
+    pad_at_episode_end: bool,
+    allowed_collect_labels: frozenset[str] | None = None,
+):
+    if pad_at_episode_end and allowed_collect_labels is None:
+        return dataset
+    return FullActionChunkLeRobotDataset(
+        dataset,
+        action_horizon,
+        pad_at_episode_end=pad_at_episode_end,
+        allowed_collect_labels=allowed_collect_labels,
+    )
+
+
+def _filter_multi_lerobot_episode_ends(
+    dataset: lerobot_dataset.MultiLeRobotDataset,
+    action_horizon: int,
+    pad_at_episode_end: Sequence[bool],
+    *,
+    allowed_collect_labels: frozenset[str] | None = None,
+):
+    if all(pad_at_episode_end) and allowed_collect_labels is None:
+        return dataset
+    return MultiLeRobotDatasetIndexFilter(
+        dataset,
+        action_horizon,
+        pad_at_episode_end,
+        allowed_collect_labels=allowed_collect_labels,
+    )
 
 
 class IterableTransformedDataset(IterableDataset[T_co]):
@@ -128,14 +367,26 @@ class FakeDataset(Dataset):
 
 
 def create_torch_dataset(
-    data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
+    data_config: _config.DataConfig,
+    action_horizon: int,
+    model_config: _model.BaseModelConfig,
+    *,
+    distill_use_rollout_data: bool | None = None,
 ) -> Dataset:
     """Create a dataset for training."""
     repo_id = data_config.repo_id
     if repo_id is None:
         raise ValueError("Repo ID is not set. Cannot create dataset.")
     if repo_id == "fake":
+        if distill_use_rollout_data is not None:
+            raise ValueError("Collect-aware distillation requires a LeRobot dataset; fake data is not supported.")
         return FakeDataset(model_config, num_samples=1024)
+
+    allowed_collect_labels = None
+    if distill_use_rollout_data is not None:
+        allowed_collect_labels = (
+            _VALID_COLLECT_LABELS if distill_use_rollout_data else _NON_ROLLOUT_COLLECT_LABELS
+        )
 
     if isinstance(repo_id, str):
         dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
@@ -144,6 +395,15 @@ def create_torch_dataset(
             delta_timestamps={
                 key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
             },
+        )
+        pad_at_episode_end = _resolve_pad_at_episode_end(
+            repo_id, data_config.pad_at_episode_end
+        )
+        dataset = _filter_lerobot_episode_ends(
+            dataset,
+            action_horizon,
+            pad_at_episode_end=pad_at_episode_end,
+            allowed_collect_labels=allowed_collect_labels,
         )
     else:
         if len(repo_id) == 0:
@@ -154,6 +414,15 @@ def create_torch_dataset(
             delta_timestamps={
                 key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
             },
+        )
+        pad_at_episode_end = _resolve_pad_at_episode_end(
+            repo_id, data_config.pad_at_episode_end
+        )
+        dataset = _filter_multi_lerobot_episode_ends(
+            dataset,
+            action_horizon,
+            pad_at_episode_end,
+            allowed_collect_labels=allowed_collect_labels,
         )
 
     if data_config.prompt_from_task:
@@ -186,11 +455,17 @@ def create_rlds_dataset(
 def _unwrap_transformed_dataset(dataset: Dataset) -> Dataset:
     # TransformedDataset is our local wrapper; unwrap it so samplers can inspect the underlying dataset type.
     while isinstance(dataset, TransformedDataset):
-        dataset = dataset._dataset
+        dataset = dataset._dataset  # noqa: SLF001
     return dataset
 
 
-def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip_norm_stats: bool = False) -> Dataset:
+def transform_dataset(
+    dataset: Dataset,
+    data_config: _config.DataConfig,
+    *,
+    skip_norm_stats: bool = False,
+    preserve_keys: Sequence[str] = (),
+) -> Dataset:
     """Transform the dataset by applying the data transforms."""
     norm_stats = {}
     if data_config.repo_id != "fake" and not skip_norm_stats:
@@ -209,6 +484,7 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
             _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
             *data_config.model_transforms.inputs,
         ],
+        preserve_keys=preserve_keys,
     )
 
 
@@ -249,7 +525,8 @@ def create_data_loader(
     num_batches: int | None = None,
     skip_norm_stats: bool = False,
     framework: Literal["jax", "pytorch"] = "jax",
-) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
+    include_distill_metadata: bool = False,
+) -> DataLoader:
     """Create a data loader for training.
 
     Args:
@@ -259,11 +536,20 @@ def create_data_loader(
         num_batches: Determines the number of batches to return.
         skip_norm_stats: Whether to skip data normalization.
         framework: The framework to use ("jax" or "pytorch").
+        include_distill_metadata: Whether to validate/filter LeRobot collect labels and return a GT mask.
     """
     data_config = config.data.create(config.assets_dirs, config.model)
     logging.info(f"data_config: {data_config}")
 
+    distill_use_rollout_data = None
+    if include_distill_metadata:
+        if config.distill_config is None:
+            raise ValueError("include_distill_metadata requires config.distill_config to be set.")
+        distill_use_rollout_data = config.distill_config.use_rollout_data
+
     if data_config.rlds_data_dir is not None:
+        if include_distill_metadata:
+            raise ValueError("Collect-aware distillation is only supported for LeRobot datasets, not RLDS datasets.")
         return create_rlds_data_loader(
             data_config,
             action_horizon=config.model.action_horizon,
@@ -286,6 +572,7 @@ def create_data_loader(
         seed=config.seed,
         skip_norm_stats=skip_norm_stats,
         framework=framework,
+        distill_use_rollout_data=distill_use_rollout_data,
     )
 
 
@@ -302,7 +589,8 @@ def create_torch_data_loader(
     num_workers: int = 0,
     seed: int = 0,
     framework: str = "jax",
-) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
+    distill_use_rollout_data: bool | None = None,
+) -> DataLoader:
     """Create a data loader for training.
 
     Args:
@@ -319,10 +607,23 @@ def create_torch_data_loader(
         num_workers: The number of worker processes to use. If zero, the data loader will
             execute in the main process.
         seed: The seed to use for shuffling the data.
+        distill_use_rollout_data: None for a regular two-item batch; otherwise enables collect-aware distillation
+            and determines whether rollout frames remain in the sampling index.
     """
-    dataset = create_torch_dataset(data_config, action_horizon, model_config)
+    dataset = create_torch_dataset(
+        data_config,
+        action_horizon,
+        model_config,
+        distill_use_rollout_data=distill_use_rollout_data,
+    )
     sampler_dataset = _unwrap_transformed_dataset(dataset)
-    dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
+    preserve_keys = (DISTILL_GT_MASK_KEY,) if distill_use_rollout_data is not None else ()
+    dataset = transform_dataset(
+        dataset,
+        data_config,
+        skip_norm_stats=skip_norm_stats,
+        preserve_keys=preserve_keys,
+    )
 
     # Use TorchDataLoader for both frameworks
     # For PyTorch DDP, create DistributedSampler and divide batch size by world size
@@ -356,7 +657,7 @@ def create_torch_data_loader(
         local_batch_size = batch_size // jax.process_count()
 
     if use_weighted_sampling:
-        if not isinstance(sampler_dataset, lerobot_dataset.MultiLeRobotDataset):
+        if not isinstance(sampler_dataset, lerobot_dataset.MultiLeRobotDataset | MultiLeRobotDatasetIndexFilter):
             raise ValueError("dataset_weights can only be used with a MultiLeRobotDataset.")
         generator = torch.Generator()
         generator.manual_seed(seed)
@@ -381,7 +682,11 @@ def create_torch_data_loader(
         framework=framework,
     )
 
-    return DataLoaderImpl(data_config, data_loader)
+    return DataLoaderImpl(
+        data_config,
+        data_loader,
+        include_distill_metadata=distill_use_rollout_data is not None,
+    )
 
 
 def create_rlds_data_loader(
@@ -535,12 +840,12 @@ class WeightedMultiDatasetSampler(torch.utils.data.Sampler):
 
     def __init__(
         self,
-        dataset: lerobot_dataset.MultiLeRobotDataset,
+        dataset: lerobot_dataset.MultiLeRobotDataset | MultiLeRobotDatasetIndexFilter,
         weights: dict[str, float] | list[float],
         num_samples: int | None = None,
         generator: torch.Generator | None = None,
     ):
-        if not isinstance(dataset, lerobot_dataset.MultiLeRobotDataset):
+        if not isinstance(dataset, lerobot_dataset.MultiLeRobotDataset | MultiLeRobotDatasetIndexFilter):
             raise ValueError("WeightedMultiDatasetSampler only works with MultiLeRobotDataset")
 
         self.dataset = dataset
@@ -564,7 +869,7 @@ class WeightedMultiDatasetSampler(torch.utils.data.Sampler):
         self._weights_tensor = torch.tensor(self.normalized_weights, dtype=torch.float32)
 
         # MultiLeRobotDataset does not expose per-dataset sizes publicly; this depends on lerobot internals.
-        self.dataset_sizes = [ds.num_frames for ds in dataset._datasets]
+        self.dataset_sizes = [ds.num_frames for ds in dataset._datasets]  # noqa: SLF001
         for repo_id, size, weight in zip(dataset.repo_ids, self.dataset_sizes, self.normalized_weights, strict=True):
             if size == 0 and weight > 0:
                 raise ValueError(f"Dataset {repo_id!r} has positive sampling weight but contains no frames")
@@ -575,7 +880,7 @@ class WeightedMultiDatasetSampler(torch.utils.data.Sampler):
         self.num_samples = num_samples if num_samples is not None else len(dataset)
         logging.info(
             "WeightedMultiDatasetSampler initialized with weights: "
-            f"{dict(zip(dataset.repo_ids, self.normalized_weights))}"
+            f"{dict(zip(dataset.repo_ids, self.normalized_weights, strict=True))}"
         )
 
     def __iter__(self):
@@ -644,13 +949,24 @@ class RLDSDataLoader:
 
 
 class DataLoaderImpl(DataLoader):
-    def __init__(self, data_config: _config.DataConfig, data_loader: TorchDataLoader | RLDSDataLoader):
+    def __init__(
+        self,
+        data_config: _config.DataConfig,
+        data_loader: TorchDataLoader | RLDSDataLoader,
+        *,
+        include_distill_metadata: bool = False,
+    ):
         self._data_config = data_config
         self._data_loader = data_loader
+        self._include_distill_metadata = include_distill_metadata
 
     def data_config(self) -> _config.DataConfig:
         return self._data_config
 
     def __iter__(self):
         for batch in self._data_loader:
-            yield _model.Observation.from_dict(batch), batch["actions"]
+            observation = _model.Observation.from_dict(batch)
+            if self._include_distill_metadata:
+                yield observation, batch["actions"], batch[DISTILL_GT_MASK_KEY]
+            else:
+                yield observation, batch["actions"]

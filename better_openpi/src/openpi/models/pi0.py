@@ -63,6 +63,17 @@ def posemb_sincos(
     return jnp.concatenate([jnp.sin(sinusoid_input), jnp.cos(sinusoid_input)], axis=-1)
 
 
+@at.typecheck
+def _masked_gt_loss(
+    prediction: at.Float[at.Array, "*b ah ad"],
+    target: at.Float[at.Array, "*b ah ad"],
+    gt_mask: at.Bool[at.Array, "*b"],
+) -> at.Float[at.Array, ""]:
+    """Average per-sample flow-matching loss over the full batch after applying the GT mask."""
+    per_sample_loss = jnp.mean(jnp.square(prediction - target), axis=(-2, -1))
+    return jnp.mean(per_sample_loss * gt_mask.astype(per_sample_loss.dtype))
+
+
 class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
@@ -239,6 +250,7 @@ class Pi0(_model.BaseModel):
         actions: _model.Actions,
         teacher: "Pi0",
         *,
+        gt_mask: at.Bool[at.Array, "*b"],
         vit_weight: float = 1.0,
         llm_weight: float = 1.0,
         flow_weight: float = 1.0,
@@ -271,8 +283,8 @@ class Pi0(_model.BaseModel):
 
         flow_loss = jnp.mean(jnp.square(s_v_t - t_v_t), axis=-1).mean()
 
-        # Average over action dim first (consistent with compute_loss), then over batch/horizon.
-        gt_loss = jnp.mean(jnp.square(s_v_t - u_t), axis=-1).mean()
+        # Rollout samples are masked out, but the reduction still divides by the full batch size.
+        gt_loss = _masked_gt_loss(s_v_t, u_t, gt_mask)
 
         total_loss = (
             vit_weight * vit_loss
@@ -285,6 +297,7 @@ class Pi0(_model.BaseModel):
             "llm_loss": llm_loss,
             "flow_loss": flow_loss,
             "gt_loss": gt_loss,
+            "rollout_fraction": 1.0 - jnp.mean(gt_mask.astype(jnp.float32)),
         }
         return total_loss, loss_dict
 

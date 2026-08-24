@@ -92,6 +92,10 @@ class DataConfig:
     # sequence is defined by the `action_horizon` field in the model config. This should be adjusted if your
     # LeRobot dataset is using different keys to represent the action.
     action_sequence_keys: Sequence[str] = ("actions",)
+    # If true, samples near the end of an episode are kept and the missing future actions are padded by repeating the
+    # final action. If false, only frames with a full action_horizon inside the same episode are sampled. For
+    # multi-dataset LeRobot configs, pass a list in repo_id order or a dict keyed by repo_id to configure each dataset.
+    pad_at_episode_end: bool | Sequence[bool] | dict[str, bool] = True
 
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
@@ -176,6 +180,7 @@ class DataConfigFactory(abc.ABC):
     # The LeRobot repo id.
     repo_id: str | list[str] = tyro.MISSING
     dataset_weights: dict[str, float] | list[float] | None = None
+    pad_at_episode_end: bool | Sequence[bool] | dict[str, bool] | None = None
     # Determines how the assets will be loaded.
     assets: AssetsConfig = dataclasses.field(default_factory=AssetsConfig)
     # Base config that will be updated by the factory.
@@ -190,6 +195,9 @@ class DataConfigFactory(abc.ABC):
         asset_id = self.assets.asset_id
         if asset_id is None and isinstance(repo_id, str):
             asset_id = repo_id
+        updates = {}
+        if self.pad_at_episode_end is not None:
+            updates["pad_at_episode_end"] = self.pad_at_episode_end
         return dataclasses.replace(
             self.base_config or DataConfig(),
             repo_id=repo_id,
@@ -197,6 +205,7 @@ class DataConfigFactory(abc.ABC):
             dataset_weights=self.dataset_weights,
             norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
             use_quantile_norm=model_config.model_type != ModelType.PI0,
+            **updates,
         )
 
     def _load_norm_stats(self, assets_dir: epath.Path, asset_id: str | None) -> dict[str, _transforms.NormStats] | None:
@@ -483,6 +492,8 @@ class LeRobotAgilexDataConfig(DataConfigFactory):
     # Gripper dimensions will remain in absolute values.
     use_delta_joint_actions: bool = True
     use_ee6d: bool = False
+    # Select active Agilex arms; inactive state/action dimensions are zeroed in single-arm modes.
+    arm_mode: Literal["left", "right", "dual"] = "dual"
 
     # Repack transforms.
     repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
@@ -509,8 +520,8 @@ class LeRobotAgilexDataConfig(DataConfigFactory):
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         data_transforms = _transforms.Group(
-            inputs=[agilex_policy.AgilexInputs(use_ee6d=self.use_ee6d)],
-            outputs=[agilex_policy.AgilexOutputs(use_ee6d=self.use_ee6d)],
+            inputs=[agilex_policy.AgilexInputs(use_ee6d=self.use_ee6d, arm_mode=self.arm_mode)],
+            outputs=[agilex_policy.AgilexOutputs(use_ee6d=self.use_ee6d, arm_mode=self.arm_mode)],
         )
         if self.use_delta_joint_actions:
             delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
@@ -665,6 +676,8 @@ class DistillConfig:
     llm_weight: float = 1.0
     flow_weight: float = 1.0
     gt_weight: float = 1.0
+    # If true, keep collect=rollout frames for distillation. Rollout frames never contribute to the GT loss.
+    use_rollout_data: bool = False
 
 
 @dataclasses.dataclass(frozen=True)

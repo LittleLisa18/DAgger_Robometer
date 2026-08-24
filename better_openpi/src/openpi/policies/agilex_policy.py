@@ -10,6 +10,35 @@ from typing_extensions import Literal
 from openpi import transforms
 
 
+_LEFT_ARM_END = 7
+_RIGHT_ARM_END = 14
+_ARM_MODES = ("left", "right", "dual")
+
+
+def _validate_arm_mode(arm_mode: str, use_ee6d: bool) -> None:
+    if arm_mode not in _ARM_MODES:
+        raise ValueError(f"arm_mode must be one of {_ARM_MODES}, got {arm_mode!r}")
+    if arm_mode != "dual" and use_ee6d:
+        raise ValueError("Single-arm modes are only supported when use_ee6d=False")
+
+
+def _mask_inactive_arm(value: np.ndarray, arm_mode: Literal["left", "right", "dual"]) -> np.ndarray:
+    """Returns the value with dimensions belonging to the inactive arm set to zero."""
+    if arm_mode == "dual":
+        return np.asarray(value)
+
+    value = np.array(value, copy=True)
+    if value.shape[-1] < _RIGHT_ARM_END:
+        raise ValueError(f"Expected at least {_RIGHT_ARM_END} dimensions, got shape {value.shape}")
+    if arm_mode == "left":
+        value[..., _LEFT_ARM_END:_RIGHT_ARM_END] = 0
+    elif arm_mode == "right":
+        value[..., :_LEFT_ARM_END] = 0
+    else:
+        raise ValueError(f"arm_mode must be one of {_ARM_MODES}, got {arm_mode!r}")
+    return value
+
+
 def make_agilex_example() -> dict:
     """Creates a random input example for the Agilex policy."""
     return {
@@ -229,6 +258,12 @@ class AgilexInputs(transforms.DataTransformFn):
     )
 
     use_ee6d: bool = False
+    # Select which arm dimensions are active. This must be applied consistently when computing normalization
+    # statistics, training, distilling, and running inference.
+    arm_mode: Literal["left", "right", "dual"] = "dual"
+
+    def __post_init__(self) -> None:
+        _validate_arm_mode(self.arm_mode, self.use_ee6d)
 
     def __call__(self, data: dict) -> dict:
         data = _decode_agilex(data)
@@ -261,6 +296,7 @@ class AgilexInputs(transforms.DataTransformFn):
                 image_masks[dest] = np.False_
 
         state = np.asarray(data["state"])
+        state = _mask_inactive_arm(state, self.arm_mode)
         if self.use_ee6d:
             if len(state.shape) == 1:
                 state = joint_to_ee6d(state)
@@ -281,6 +317,7 @@ class AgilexInputs(transforms.DataTransformFn):
         # Actions are only available during training.
         if "actions" in data:
             actions = np.asarray(data["actions"])
+            actions = _mask_inactive_arm(actions, self.arm_mode)
             if self.use_ee6d:
                 assert len(actions.shape) == 2, f"Expected actions to have shape (N, 14), got {actions.shape}"
                 ee6d_actions = np.zeros((actions.shape[0], 20))
@@ -296,7 +333,9 @@ class AgilexInputs(transforms.DataTransformFn):
             inputs["delay"] = data["delay"]
 
         if "action_prefix" in data:
-            inputs["action_prefix"] = data["action_prefix"]
+            action_prefix = np.asarray(data["action_prefix"])
+            action_prefix = _mask_inactive_arm(action_prefix, self.arm_mode)
+            inputs["action_prefix"] = action_prefix
 
         return inputs
 
@@ -306,6 +345,11 @@ class AgilexOutputs(transforms.DataTransformFn):
     """Outputs for the Agilex policy."""
 
     use_ee6d: bool = False
+    # Keep the standard 14-dimensional output contract, but zero the inactive arm in single-arm modes.
+    arm_mode: Literal["left", "right", "dual"] = "dual"
+
+    def __post_init__(self) -> None:
+        _validate_arm_mode(self.arm_mode, self.use_ee6d)
 
     def __call__(self, data: dict) -> dict:
         if self.use_ee6d:
@@ -313,6 +357,7 @@ class AgilexOutputs(transforms.DataTransformFn):
         else:
             # Only return the first 14 dims.
             actions = np.asarray(data["actions"][:, :14])
+            actions = _mask_inactive_arm(actions, self.arm_mode)
         return {"actions": actions}
 
 

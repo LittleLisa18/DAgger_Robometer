@@ -169,7 +169,7 @@ def distill_train_step(
     teacher_def: nnx.GraphDef,
     rng: at.KeyArrayLike,
     state: training_utils.TrainState,
-    batch: tuple[_model.Observation, _model.Actions],
+    batch: tuple[_model.Observation, _model.Actions, at.Bool[at.Array, " b"]],
     teacher_params: nnx.State,
 ) -> tuple[training_utils.TrainState, dict[str, at.Array]]:
     model = nnx.merge(state.model_def, state.params)
@@ -184,6 +184,7 @@ def distill_train_step(
         rng: at.KeyArrayLike,
         observation: _model.Observation,
         actions: _model.Actions,
+        gt_mask: at.Bool[at.Array, " b"],
     ):
         dc = config.distill_config
         return model.compute_distill_loss(
@@ -191,6 +192,7 @@ def distill_train_step(
             observation,
             actions,
             teacher,
+            gt_mask=gt_mask,
             vit_weight=dc.vit_weight,
             llm_weight=dc.llm_weight,
             flow_weight=dc.flow_weight,
@@ -199,11 +201,11 @@ def distill_train_step(
         )
 
     train_rng = jax.random.fold_in(rng, state.step)
-    observation, actions = batch
+    observation, actions, gt_mask = batch
 
     diff_state = nnx.DiffState(0, config.trainable_filter)
     (loss, loss_dict), grads = nnx.value_and_grad(loss_fn, argnums=diff_state, has_aux=True)(
-        model, train_rng, observation, actions
+        model, train_rng, observation, actions, gt_mask
     )
 
     params = state.params.filter(config.trainable_filter)
@@ -269,7 +271,12 @@ def main(config: _config.TrainConfig):
     )
     init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
 
-    data_loader = _data_loader.create_data_loader(config, sharding=data_sharding, shuffle=True)
+    data_loader = _data_loader.create_data_loader(
+        config,
+        sharding=data_sharding,
+        shuffle=True,
+        include_distill_metadata=True,
+    )
     data_iter = iter(data_loader)
     batch = next(data_iter)
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
