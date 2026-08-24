@@ -63,7 +63,7 @@ class Policy(BasePolicy):
         else:
             # JAX model setup
             self._sample_actions = nnx_utils.module_jit(
-                model.sample_actions, static_argnames=("num_steps", "infer_time_schedule", "alpha", "u0")
+                model.sample_actions, static_argnames=("num_steps", "solver", "infer_time_schedule", "alpha", "u0")
             )
 
             # Explicitly split and JIT the Streaming API to avoid io_callback bottlenecks

@@ -1,4 +1,6 @@
+from collections.abc import Callable
 import logging
+from typing import Literal
 
 import einops
 import flax.nnx as nnx
@@ -14,6 +16,80 @@ import openpi.models.siglip as _siglip
 from openpi.shared import array_typing as at
 
 logger = logging.getLogger("openpi")
+
+_DPM_T_MAX = 0.999
+
+
+def _ode_solver_step(
+    velocity_fn: Callable[[at.Float[at.Array, "*b"], at.Float[at.Array, ""]], at.Float[at.Array, "*b"]],
+    sample: at.Float[at.Array, "*b"],
+    time: at.Float[at.Array, ""],
+    dt: at.Float[at.Array, ""],
+    *,
+    solver: Literal["euler", "midpoint", "heun"],
+) -> at.Float[at.Array, "*b"]:
+    """Advance one ODE interval with an explicit Euler or second-order Runge--Kutta method."""
+    initial_velocity = velocity_fn(sample, time)
+    if solver == "euler":
+        return sample + dt * initial_velocity
+    if solver == "midpoint":
+        midpoint_sample = sample + 0.5 * dt * initial_velocity
+        midpoint_velocity = velocity_fn(midpoint_sample, time + 0.5 * dt)
+        return sample + dt * midpoint_velocity
+    if solver == "heun":
+        euler_sample = sample + dt * initial_velocity
+        final_velocity = velocity_fn(euler_sample, time + dt)
+        return sample + 0.5 * dt * (initial_velocity + final_velocity)
+    raise ValueError(f"Unsupported ODE solver type: {solver!r}")
+
+
+def _flow_log_snr(time: at.Float[at.Array, ""]) -> at.Float[at.Array, ""]:
+    """Return log(alpha_t / sigma_t) for the linear flow schedule."""
+    return jnp.log1p(-time) - jnp.log(time)
+
+
+def _dpmpp_first_order_update(
+    sample: at.Float[at.Array, "*b"],
+    x0_prediction: at.Float[at.Array, "*b"],
+    time: at.Float[at.Array, ""],
+    next_time: at.Float[at.Array, ""],
+) -> at.Float[at.Array, "*b"]:
+    """Apply a first-order DPM-Solver++ update for the linear flow schedule."""
+    alpha_next = 1.0 - next_time
+    sigma, sigma_next = time, next_time
+    h = _flow_log_snr(next_time) - _flow_log_snr(time)
+    return (sigma_next / sigma) * sample - alpha_next * jnp.expm1(-h) * x0_prediction
+
+
+def _dpmpp_2m_update(
+    sample: at.Float[at.Array, "*b"],
+    x0_prediction: at.Float[at.Array, "*b"],
+    previous_x0_prediction: at.Float[at.Array, "*b"],
+    previous_time: at.Float[at.Array, ""],
+    time: at.Float[at.Array, ""],
+    next_time: at.Float[at.Array, ""],
+    solver_type: Literal["midpoint", "heun"] = "midpoint",
+) -> at.Float[at.Array, "*b"]:
+    """Apply a second-order multistep DPM-Solver++ midpoint or Heun update."""
+    lambda_previous = _flow_log_snr(previous_time)
+    lambda_current = _flow_log_snr(time)
+    lambda_next = _flow_log_snr(next_time)
+    h = lambda_next - lambda_current
+    h_previous = lambda_current - lambda_previous
+    r = h_previous / h
+    first_derivative = (x0_prediction - previous_x0_prediction) / r
+
+    alpha_next = 1.0 - next_time
+    sigma, sigma_next = time, next_time
+    phi_1 = jnp.expm1(-h)
+    if solver_type == "midpoint":
+        correction = -0.5 * alpha_next * phi_1 * first_derivative
+    elif solver_type == "heun":
+        correction = alpha_next * (phi_1 / h + 1.0) * first_derivative
+    else:
+        raise ValueError(f"Unsupported DPM-Solver++ 2M solver type: {solver_type!r}")
+
+    return (sigma_next / sigma) * sample - alpha_next * phi_1 * x0_prediction + correction
 
 
 def make_attn_mask(input_mask, mask_ar):
@@ -337,11 +413,23 @@ class Pi0(_model.BaseModel):
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
+        solver: Literal["euler", "dpmpp_2m", "midpoint", "heun"] = "euler",
     ) -> _model.Actions:
+        """Sample actions with an ODE solver or multistep DPM-Solver++.
+
+        ``num_steps`` is the number of integration intervals. Euler and DPM-Solver++ 2M use one model
+        evaluation per interval, while midpoint and Heun are two-stage RK2 methods and use two.
+        """
+        if isinstance(num_steps, int) and num_steps < 1:
+            raise ValueError(f"num_steps must be at least 1, got {num_steps}")
+        if solver not in ("euler", "dpmpp_2m", "midpoint", "heun"):
+            raise ValueError(
+                f"Unsupported solver {solver!r}; expected 'euler', 'dpmpp_2m', 'midpoint', or 'heun'"
+            )
+
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
-        dt = -1.0 / num_steps
         batch_size = observation.state.shape[0]
         if noise is None:
             noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
@@ -352,8 +440,7 @@ class Pi0(_model.BaseModel):
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
         _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
 
-        def step(carry):
-            x_t, time = carry
+        def denoise_step(x_t, time):
             suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
                 observation, x_t, jnp.broadcast_to(time, batch_size)
             )
@@ -382,14 +469,69 @@ class Pi0(_model.BaseModel):
                 adarms_cond=[None, adarms_cond],
             )
             assert prefix_out is None
-            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+            return self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
-            return x_t + dt * v_t, time + dt
+        if solver in ("euler", "midpoint", "heun"):
 
-        def cond(carry):
-            x_t, time = carry
-            # robust to floating-point error
-            return time >= -dt / 2
+            def ode_step(carry):
+                x_t, step_index = carry
+                step_fraction = step_index.astype(jnp.float32) / num_steps
+                next_step_fraction = (step_index + 1).astype(jnp.float32) / num_steps
+                time = 1.0 - step_fraction
+                next_time = 1.0 - next_step_fraction
+                x_next = _ode_solver_step(
+                    denoise_step,
+                    x_t,
+                    time,
+                    next_time - time,
+                    solver=solver,
+                )
+                return x_next, step_index + 1
 
-        x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
+            def ode_cond(carry):
+                return carry[1] < num_steps
+
+            initial_carry = (noise, jnp.asarray(0, dtype=jnp.int32))
+            x_0, _ = jax.lax.while_loop(ode_cond, ode_step, initial_carry)
+            return x_0
+
+        dpm_t_max = jnp.asarray(_DPM_T_MAX, dtype=jnp.float32)
+
+        def dpm_step(carry):
+            x_t, previous_x0_prediction, previous_time, step_index = carry
+            step_fraction = step_index.astype(jnp.float32) / num_steps
+            next_step_fraction = (step_index + 1).astype(jnp.float32) / num_steps
+            time = dpm_t_max * (1.0 - step_fraction)
+            next_time = dpm_t_max * (1.0 - next_step_fraction)
+
+            v_t = denoise_step(x_t, time)
+            x0_prediction = x_t - time * v_t
+
+            is_first_step = step_index == 0
+            is_last_step = step_index == num_steps - 1
+
+            def nonfinal_update(_):
+                return jax.lax.cond(
+                    is_first_step,
+                    lambda: _dpmpp_first_order_update(x_t, x0_prediction, time, next_time),
+                    lambda: _dpmpp_2m_update(
+                        x_t,
+                        x0_prediction,
+                        previous_x0_prediction,
+                        previous_time,
+                        time,
+                        next_time,
+                        solver_type="midpoint",
+                    ),
+                )
+
+            # At t=0, the DPM-Solver++ first-order limit is exactly the current data prediction.
+            x_next = jax.lax.cond(is_last_step, lambda _: x0_prediction, nonfinal_update, operand=None)
+            return x_next, x0_prediction, time, step_index + 1
+
+        def dpm_cond(carry):
+            return carry[3] < num_steps
+
+        initial_carry = (noise, jnp.zeros_like(noise), dpm_t_max, jnp.asarray(0, dtype=jnp.int32))
+        x_0, _, _, _ = jax.lax.while_loop(dpm_cond, dpm_step, initial_carry)
         return x_0

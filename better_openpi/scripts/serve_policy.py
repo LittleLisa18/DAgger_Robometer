@@ -2,9 +2,11 @@ import dataclasses
 import enum
 import logging
 import socket
+from typing import Literal
 
 import tyro
 
+from openpi.models import pi0_config as _pi0_config
 from openpi.policies import policy as _policy
 from openpi.policies import policy_config as _policy_config
 from openpi.serving import websocket_policy_server
@@ -67,6 +69,7 @@ class Args:
     alpha: float = 0.6
     u0: float = 0.9
     num_steps: int = 10
+    solver: Literal["euler", "dpmpp_2m", "midpoint", "heun"] = "euler"
 
 
 # Default checkpoints that should be used for each environment.
@@ -90,6 +93,29 @@ DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
 }
 
 
+def _make_sample_kwargs(args: Args, model_config) -> dict[str, object]:
+    """Build sampling kwargs supported by the selected model implementation."""
+    if not args.use_custom_sample_kwargs:
+        return {}
+
+    if isinstance(model_config, _pi0_config.Pi0Config):
+        return {
+            "num_steps": args.num_steps,
+            "solver": args.solver,
+        }
+
+    if isinstance(model_config, _pi0_config.Pi0FasterConfig):
+        return {
+            "infer_time_schedule": args.infer_time_schedule,
+            "alpha": args.alpha,
+            "u0": args.u0,
+            "num_steps": args.num_steps,
+        }
+
+    # Other model families have their own sampling interfaces.
+    return {}
+
+
 def create_default_policy(env: EnvMode, *, default_prompt: str | None = None) -> _policy.Policy:
     """Create a default policy for the given environment."""
     if checkpoint := DEFAULT_CHECKPOINT.get(env):
@@ -103,21 +129,12 @@ def create_policy(args: Args) -> _policy.Policy:
     """Create a policy from the given arguments."""
     match args.policy:
         case Checkpoint():
-            sample_kwargs = (
-                {
-                    "infer_time_schedule": args.infer_time_schedule,
-                    "alpha": args.alpha,
-                    "u0": args.u0,
-                    "num_steps": args.num_steps,
-                }
-                if args.use_custom_sample_kwargs
-                else {}
-            )
+            train_config = _config.get_config(args.policy.config)
             return _policy_config.create_trained_policy(
-                _config.get_config(args.policy.config),
+                train_config,
                 args.policy.dir,
                 default_prompt=args.default_prompt,
-                sample_kwargs=sample_kwargs,
+                sample_kwargs=_make_sample_kwargs(args, train_config.model),
             )
         case Default():
             return create_default_policy(args.env, default_prompt=args.default_prompt)
