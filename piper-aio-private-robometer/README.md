@@ -428,8 +428,15 @@ python inference/infer_hg_dagger.py \
   --host 127.0.0.1 \
   --port 8000 \
   --ctrl_type joint \
-  --save_dir ~/data
+  --save_dir ~/data \
+  --timing_summary ~/data/human_dagger_timing_summary.csv
 ```
+
+Press `SPACE` when the Student fails, then select `d` to start Human DAgger.
+After completing the correction, exit DAgger collection with `c` and reset the
+episode with `r`. At the existing save prompt, `s` records a successful Human
+DAgger attempt and saves the episode, while `q` records a failed attempt and
+discards it. Timing records are independent of saved HDF5 episode indices.
 
 #### Teacher DAgger Inference
 

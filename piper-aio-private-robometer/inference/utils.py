@@ -508,17 +508,17 @@ class InferenceDataRecorder:
 
     def save_episode(self, require_confirmation=True):
         if not self.enabled:
-            return
+            return False
         if len(self.actions) == 0:
             print("\033[31m\nNo inference data to save (0 frames recorded).\033[0m")
             self.reset()
-            return
+            return False
 
         print("len(timesteps): ", len(self.timesteps))
         print("len(actions)  : ", len(self.actions))
         if require_confirmation and self.wait_save_choice() != "s":
             self.discard_episode()
-            return
+            return False
 
         dataset_path = os.path.join(self.save_dir, f"episode_{self.episode_idx}")
         save_inference_data(
@@ -531,6 +531,7 @@ class InferenceDataRecorder:
         print(f"\033[32mEpisode {self.episode_idx} saved successfully!\033[0m")
         self.episode_idx += 1
         self.reset()
+        return True
 
 
 # Image Utilities

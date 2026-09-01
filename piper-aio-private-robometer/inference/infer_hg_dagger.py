@@ -18,6 +18,7 @@ Data layout (matches collect_data output format):
 
 import argparse
 import collections
+import csv
 import os
 import signal
 import sys
@@ -25,6 +26,7 @@ import termios
 import threading
 import time
 import tty
+from datetime import datetime
 
 import dm_env
 import numpy as np
@@ -54,6 +56,113 @@ from ros_operator import RosOperator
 # ──────────────────────────────────────────────────────────────────────────────
 
 shutdown_event = threading.Event()
+
+
+class HumanDaggerTimingLogger:
+    """Persist timing for every Human DAgger attempt, independently of saved episodes."""
+
+    FIELDNAMES = (
+        "run_id",
+        "task",
+        "started_at",
+        "ended_at",
+        "student_duration_s",
+        "student_start_to_failure_s",
+        "human_duration_s",
+        "human_dagger_to_failure_s",
+        "human_dagger_to_success_s",
+        "human_outcome",
+        "final_success",
+        "end_reason",
+    )
+
+    def __init__(self, path, task):
+        self.path = os.path.abspath(os.path.expanduser(path))
+        self.task = task
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        self.next_run_id = self._read_next_run_id()
+        self.current = None
+        print(f"Human DAgger timing summary: {self.path}")
+
+    def _read_next_run_id(self):
+        if not os.path.isfile(self.path):
+            return 0
+        try:
+            with open(self.path, newline="", encoding="utf-8") as summary_file:
+                rows = list(csv.DictReader(summary_file))
+            return max((int(row["run_id"]) for row in rows), default=-1) + 1
+        except (OSError, KeyError, TypeError, ValueError):
+            return int(time.time() * 1000)
+
+    def start(self):
+        if self.current is not None:
+            raise RuntimeError("Previous Human DAgger timing attempt is still active")
+        self.current = {
+            "run_id": self.next_run_id,
+            "started_at": datetime.now().astimezone().isoformat(timespec="milliseconds"),
+            "student_started": time.monotonic(),
+            "student_failed": None,
+            "human_started": None,
+        }
+        self.next_run_id += 1
+
+    def mark_student_failure(self):
+        if self.current is not None and self.current["student_failed"] is None:
+            self.current["student_failed"] = time.monotonic()
+
+    def start_human(self):
+        if self.current is None:
+            return
+        self.mark_student_failure()
+        if self.current["human_started"] is None:
+            self.current["human_started"] = time.monotonic()
+
+    @staticmethod
+    def _duration(start, end):
+        if start is None or end is None:
+            return ""
+        return f"{end - start:.3f}"
+
+    def finish(self, success, end_reason):
+        if self.current is None:
+            return
+        now = time.monotonic()
+        student_end = self.current["student_failed"] or now
+        student_duration = self._duration(self.current["student_started"], student_end)
+        human_duration = self._duration(self.current["human_started"], now)
+        human_outcome = "not_started"
+        if self.current["human_started"] is not None:
+            human_outcome = "success" if success else "failure"
+
+        row = {
+            "run_id": self.current["run_id"],
+            "task": self.task,
+            "started_at": self.current["started_at"],
+            "ended_at": datetime.now().astimezone().isoformat(timespec="milliseconds"),
+            "student_duration_s": student_duration,
+            "student_start_to_failure_s": (
+                student_duration if self.current["student_failed"] is not None else ""
+            ),
+            "human_duration_s": human_duration,
+            "human_dagger_to_failure_s": human_duration if human_outcome == "failure" else "",
+            "human_dagger_to_success_s": human_duration if human_outcome == "success" else "",
+            "human_outcome": human_outcome,
+            "final_success": int(bool(success)),
+            "end_reason": end_reason,
+        }
+        file_exists = os.path.isfile(self.path) and os.path.getsize(self.path) > 0
+        with open(self.path, "a", newline="", encoding="utf-8") as summary_file:
+            writer = csv.DictWriter(summary_file, fieldnames=self.FIELDNAMES)
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(row)
+            summary_file.flush()
+            os.fsync(summary_file.fileno())
+        print(f"Human DAgger timing record {row['run_id']} saved: {end_reason}")
+        self.current = None
+
+    def finish_interrupted(self):
+        self.finish(success=False, end_reason="interrupted")
 
 
 def _on_sigint(signum, frame):
@@ -250,16 +359,20 @@ def _wait_after_reset():
     return "quit"
 
 
-def _reset_episode(policy, ros_operator, collector, recorder, left0, right0):
+def _reset_episode(policy, ros_operator, collector, recorder, timing_logger, left0, right0):
     """Close the current episode and reset every episode-scoped state."""
     collector.reset()
     reset_observation_window()
     if not policy.reset_episode():
         raise RuntimeError("Reset aborted: live Robometer episode could not be reset")
-    recorder.save_episode()
+    episode_saved = recorder.save_episode()
+    timing_logger.finish(
+        success=episode_saved,
+        end_reason="human_dagger_success" if episode_saved else "human_dagger_failure",
+    )
     recorder.reset()
     ros_operator.move_arms_to_initial_pose(left0, right0)
-    return _wait_after_reset()
+    return _wait_after_reset(), episode_saved
 
 
 def run_dagger_session(args, config, ros_operator, collector, recorder):
@@ -327,6 +440,11 @@ def model_inference(args, config, ros_operator):
 
     recorder = InferenceDataRecorder(args, config, shutdown_event=shutdown_event)
     collector = DaggerCollector()
+    timing_summary_path = args.timing_summary
+    if timing_summary_path is None:
+        timing_summary_dir = os.path.expanduser(args.save_dir) if args.save_dir else os.getcwd()
+        timing_summary_path = os.path.join(timing_summary_dir, "human_dagger_timing_summary.csv")
+    timing_logger = HumanDaggerTimingLogger(timing_summary_path, args.task)
 
     print("\n" + "=" * 50)
     print("CONTROLS")
@@ -353,14 +471,19 @@ def model_inference(args, config, ros_operator):
             action_buffer = np.zeros([chunk_size, config["state_dim"]])
             force_replan = True
             episode_closed = False
+            timing_logger.start()
 
             while t < max_publish_step and not rospy.is_shutdown() and not shutdown_event.is_set():
                 key = " " if failure_monitor.pause_event.is_set() else check_keyboard_input()
                 if key == " ":
+                    # In Human DAgger, Space is the human-declared Student failure signal.
+                    timing_logger.mark_student_failure()
                     restart_episode = False
                     while True:
                         result = handle_interactive_mode(task_time, enable_dagger=True)
                         if result == "dagger":
+                            # The Human correction timer starts when 'd' is selected.
+                            timing_logger.start_human()
                             dagger_result = run_dagger_session(args, config, ros_operator, collector, recorder)
                             if dagger_result == "shutdown":
                                 return
@@ -372,20 +495,28 @@ def model_inference(args, config, ros_operator):
                         if result == "reset":
                             failure_monitor.clear_pause()
                             episode_closed = True
-                            if _reset_episode(
+                            next_action, _episode_saved = _reset_episode(
                                 policy,
                                 ros_operator,
                                 collector,
                                 recorder,
+                                timing_logger,
                                 left0,
                                 right0,
-                            ) == "quit":
+                            )
+                            if next_action == "quit":
                                 return
                             task_time = time.time()
                             restart_episode = True
                             break
                         if result == "quit":
-                            recorder.save_episode()
+                            episode_saved = recorder.save_episode()
+                            timing_logger.finish(
+                                success=episode_saved,
+                                end_reason=(
+                                    "human_dagger_success" if episode_saved else "human_dagger_failure"
+                                ),
+                            )
                             return
                         if not policy.resume_robometer():
                             raise RuntimeError("Continue aborted: live Robometer could not be resumed")
@@ -429,7 +560,11 @@ def model_inference(args, config, ros_operator):
                 rate.sleep()
 
             if not episode_closed:
-                recorder.save_episode()
+                episode_saved = recorder.save_episode()
+                timing_logger.finish(
+                    success=episode_saved,
+                    end_reason="human_dagger_success" if episode_saved else "human_dagger_failure",
+                )
             if shutdown_event.is_set():
                 return
 
@@ -448,6 +583,8 @@ def model_inference(args, config, ros_operator):
             print(f"DAgger stopped on first error: {exc}")
         raise
     finally:
+        # Interrupted attempts keep timing only; no rollout is saved here.
+        timing_logger.finish_interrupted()
         failure_monitor.stop()
         _restore_exit_state(ros_operator, left0, right0, move_to_initial=not faulted)
 
@@ -489,6 +626,12 @@ def get_arguments():
     parser.add_argument("--fix_zero", type=str, choices=["left", "right", "none"], default="none")
     # Unified data recording
     parser.add_argument("--save_dir", type=str, required=True, help="Directory for unified rollout+DAgger HDF5 files")
+    parser.add_argument(
+        "--timing_summary",
+        type=str,
+        default=None,
+        help="Human DAgger timing CSV path (default: <save_dir>/human_dagger_timing_summary.csv)",
+    )
     # DAgger-specific
     parser.add_argument("--teach_leader_enable_left_topic", type=str, default="/teach/leader_enable_left")
     parser.add_argument("--teach_leader_enable_right_topic", type=str, default="/teach/leader_enable_right")

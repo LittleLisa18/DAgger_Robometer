@@ -1,4 +1,5 @@
 import argparse
+import csv
 import os
 import signal
 import sys
@@ -7,6 +8,7 @@ import threading
 import time
 import tty
 from collections import deque
+from datetime import datetime
 
 import numpy as np
 import rospy
@@ -43,6 +45,147 @@ episode_id = 0
 inference_state_lock = threading.Lock()
 inference_state_cond = threading.Condition(inference_state_lock)
 inflight_inference_count = 0
+
+
+class EpisodeTimingLogger:
+    """Append one timing record for every attempted AutoDAgger episode."""
+
+    FIELDNAMES = (
+        "run_id",
+        "task",
+        "started_at",
+        "ended_at",
+        "student_duration_s",
+        "student_outcome",
+        "student_start_to_failure_s",
+        "teacher_duration_s",
+        "teacher_takeover_to_failure_s",
+        "teacher_takeover_to_success_s",
+        "teacher_outcome",
+        "final_success",
+        "end_reason",
+    )
+
+    def __init__(self, path, task):
+        self.path = os.path.abspath(os.path.expanduser(path))
+        self.task = task
+        self._next_run_id = self._read_next_run_id()
+        self.current = None
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        print(f"AutoDAgger timing summary: {self.path}")
+
+    def _read_next_run_id(self):
+        if not os.path.isfile(self.path):
+            return 0
+        try:
+            with open(self.path, newline="", encoding="utf-8") as summary_file:
+                rows = list(csv.DictReader(summary_file))
+            return max((int(row["run_id"]) for row in rows), default=-1) + 1
+        except (OSError, KeyError, TypeError, ValueError):
+            # Preserve an existing file with an unexpected format and continue
+            # with a timestamp-derived id instead of overwriting any records.
+            return int(time.time() * 1000)
+
+    def start(self):
+        if self.current is not None:
+            raise RuntimeError("Cannot start a new timing record before finishing the current one")
+        now = time.monotonic()
+        self.current = {
+            "run_id": self._next_run_id,
+            "task": self.task,
+            "started_at": datetime.now().astimezone().isoformat(timespec="milliseconds"),
+            "student_started_monotonic": now,
+            "student_ended_monotonic": None,
+            "student_outcome": "running",
+            "teacher_started_monotonic": None,
+            "teacher_ended_monotonic": None,
+            "teacher_outcome": "not_started",
+        }
+        self._next_run_id += 1
+
+    def finish_student(self, outcome):
+        if self.current is None or self.current["student_ended_monotonic"] is not None:
+            return
+        self.current["student_ended_monotonic"] = time.monotonic()
+        self.current["student_outcome"] = outcome
+
+    def start_teacher(self, student_outcome="failure"):
+        if self.current is None:
+            return
+        self.finish_student(student_outcome)
+        if self.current["teacher_started_monotonic"] is None:
+            self.current["teacher_started_monotonic"] = time.monotonic()
+            self.current["teacher_outcome"] = "running"
+
+    def finish_teacher(self, outcome):
+        if self.current is None or self.current["teacher_started_monotonic"] is None:
+            return
+        if self.current["teacher_ended_monotonic"] is None:
+            self.current["teacher_ended_monotonic"] = time.monotonic()
+            self.current["teacher_outcome"] = outcome
+
+    @staticmethod
+    def _duration(start, end):
+        if start is None or end is None:
+            return ""
+        return f"{end - start:.3f}"
+
+    def finish(self, final_success, end_reason):
+        if self.current is None:
+            return
+
+        now = time.monotonic()
+        if self.current["student_ended_monotonic"] is None:
+            self.current["student_ended_monotonic"] = now
+            self.current["student_outcome"] = end_reason
+        if (
+            self.current["teacher_started_monotonic"] is not None
+            and self.current["teacher_ended_monotonic"] is None
+        ):
+            self.current["teacher_ended_monotonic"] = now
+            self.current["teacher_outcome"] = end_reason
+
+        student_duration = self._duration(
+            self.current["student_started_monotonic"], self.current["student_ended_monotonic"]
+        )
+        teacher_duration = self._duration(
+            self.current["teacher_started_monotonic"], self.current["teacher_ended_monotonic"]
+        )
+        row = {
+            "run_id": self.current["run_id"],
+            "task": self.current["task"],
+            "started_at": self.current["started_at"],
+            "ended_at": datetime.now().astimezone().isoformat(timespec="milliseconds"),
+            "student_duration_s": student_duration,
+            "student_outcome": self.current["student_outcome"],
+            "student_start_to_failure_s": (
+                student_duration if self.current["student_outcome"] == "failure" else ""
+            ),
+            "teacher_duration_s": teacher_duration,
+            "teacher_takeover_to_failure_s": (
+                teacher_duration if self.current["teacher_outcome"] == "failure" else ""
+            ),
+            "teacher_takeover_to_success_s": (
+                teacher_duration if self.current["teacher_outcome"] == "success" else ""
+            ),
+            "teacher_outcome": self.current["teacher_outcome"],
+            "final_success": int(bool(final_success)),
+            "end_reason": end_reason,
+        }
+
+        file_exists = os.path.isfile(self.path) and os.path.getsize(self.path) > 0
+        with open(self.path, "a", newline="", encoding="utf-8") as summary_file:
+            writer = csv.DictWriter(summary_file, fieldnames=self.FIELDNAMES)
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(row)
+            summary_file.flush()
+            os.fsync(summary_file.fileno())
+        print(f"Timing record {row['run_id']} saved: {end_reason}")
+        self.current = None
+
+    def finish_interrupted(self):
+        self.finish(final_success=False, end_reason="interrupted")
 
 
 def _on_sigint(signum, frame):
@@ -584,6 +727,11 @@ def model_inference(args, config, ros_operator):
     )
     start_inference_thread(args, config, policy_switcher, ros_operator, action_buffer)
     recorder = InferenceDataRecorder(args, config, shutdown_event=shutdown_event)
+    timing_summary_path = args.timing_summary
+    if timing_summary_path is None:
+        timing_summary_dir = os.path.expanduser(args.save_dir) if args.save_dir else os.getcwd()
+        timing_summary_path = os.path.join(timing_summary_dir, "autodagger_timing_summary.csv")
+    timing_logger = EpisodeTimingLogger(timing_summary_path, args.task)
     command_lock = threading.Lock()
     monitor = AutomaticRobometerMonitor(
         policy_switcher,
@@ -615,7 +763,10 @@ def model_inference(args, config, ros_operator):
 
             inference_stamp = 0
             episode_result = None
+            episode_end_reason = None
+            final_success = False
 
+            timing_logger.start()
             actions = infer_active_chunk(args, config, policy_switcher, ros_operator)
             assert actions is not None, "Initial sync inference returned None"
             action_buffer.integrate_first_chunk(actions[:chunk_size])
@@ -625,6 +776,7 @@ def model_inference(args, config, ros_operator):
             while t < max_publish_step and not rospy.is_shutdown() and not shutdown_event.is_set():
                 failure_phase = monitor.consume_failure()
                 if failure_phase == "student":
+                    timing_logger.start_teacher()
                     print("\033[33mSwitching automatically from Student to Teacher...\033[0m")
                     monitor.set_phase("idle")
                     inference_paused.clear()
@@ -635,33 +787,43 @@ def model_inference(args, config, ros_operator):
                     last_valid_act = None
                     if not teacher_policy.reset_episode():
                         episode_result = "discard"
+                        episode_end_reason = "teacher_reset_failure"
                         rospy.logerr("Teacher Robometer reset failed; discarding episode")
                         break
                     monitor.set_phase("teacher")
                     actions = infer_active_chunk(args, config, policy_switcher, ros_operator)
                     if actions is None or monitor.failure_event.is_set():
                         episode_result = "discard"
+                        episode_end_reason = "teacher_inference_failure"
                         break
                     action_buffer.integrate_first_chunk(actions[:chunk_size])
                     continue
                 if failure_phase == "teacher":
+                    timing_logger.finish_teacher("failure")
                     print("\033[31mTeacher also failed; discarding this episode.\033[0m")
                     episode_result = "discard"
+                    episode_end_reason = "teacher_failure"
                     break
                 success_phase = monitor.consume_success()
                 if success_phase == "student":
+                    timing_logger.finish_student("success")
                     print(
                         f"\033[32mStudent success sustained for "
                         f"{args.student_success_duration:.1f}s; discarding this non-DAgger episode.\033[0m"
                     )
                     episode_result = "discard"
+                    episode_end_reason = "student_success"
+                    final_success = True
                     break
                 if success_phase == "teacher":
+                    timing_logger.finish_teacher("success")
                     print(
                         f"\033[32mTeacher success sustained for "
                         f"{args.teacher_success_duration:.1f}s; episode complete.\033[0m"
                     )
                     episode_result = "success"
+                    episode_end_reason = "teacher_success"
+                    final_success = True
                     break
 
                 print(
@@ -675,11 +837,13 @@ def model_inference(args, config, ros_operator):
                     if result == "reset":
                         recorder.discard_episode()
                         episode_result = "discard"
+                        episode_end_reason = "manual_reset"
                         if policy_switcher.active_name != "student":
                             policy_switcher.switch_to("student")
                         break
                     if result == "quit":
                         recorder.discard_episode()
+                        timing_logger.finish(final_success=False, end_reason="manual_quit")
                         return
                     if policy_changed:
                         # Keep the manual override safe and consistent with the
@@ -694,13 +858,19 @@ def model_inference(args, config, ros_operator):
                         reset_observation_window()
                         last_valid_act = None
                         active_name = policy_switcher.active_name
+                        if active_name == "teacher":
+                            timing_logger.start_teacher(student_outcome="manual_takeover")
+                        else:
+                            timing_logger.finish_teacher("manual_switch_to_student")
                         if not policy_switcher.active_policy.reset_episode():
                             episode_result = "discard"
+                            episode_end_reason = f"{active_name}_reset_failure"
                             break
                         monitor.set_phase(active_name)
                         actions = infer_active_chunk(args, config, policy_switcher, ros_operator)
                         if actions is None or monitor.failure_event.is_set():
                             episode_result = "discard"
+                            episode_end_reason = f"{active_name}_inference_failure"
                             break
                         action_buffer.integrate_first_chunk(actions[:chunk_size])
 
@@ -725,6 +895,7 @@ def model_inference(args, config, ros_operator):
 
                 observation_to_save = get_rollout_observation(args, config, ros_operator) if recorder.enabled else None
                 if recorder.enabled and observation_to_save is None:
+                    episode_end_reason = "observation_unavailable"
                     break
 
                 if args.ctrl_type == "joint":
@@ -763,12 +934,18 @@ def model_inference(args, config, ros_operator):
                 if episode_result is None:
                     print("\033[31mEpisode limit reached without confirmed Teacher success; discarding.\033[0m")
                 recorder.discard_episode()
+            if episode_end_reason is None:
+                episode_end_reason = "interrupted" if shutdown_event.is_set() else "episode_limit"
+            timing_logger.finish(final_success=final_success, end_reason=episode_end_reason)
             reset_robot_for_next_episode(ros_operator, left0, right0)
             if shutdown_event.is_set():
                 return
             input("Episode reset. Press enter to start the next instruction")
             task_time = time.time()
     finally:
+        # Timing is independent from rollout persistence: interrupted attempts
+        # are logged, but no HDF5 episode is saved here.
+        timing_logger.finish_interrupted()
         monitor.stop()
         ros_operator.follower_arm_publish_continuous(left0, right0)
 
@@ -961,6 +1138,15 @@ def get_arguments():
         help="Directory used when --save_rollout is set.",
         default="",
         required=False,
+    )
+    parser.add_argument(
+        "--timing_summary",
+        type=str,
+        help=(
+            "CSV path for per-attempt AutoDAgger timing records. Defaults to "
+            "<save_dir>/autodagger_timing_summary.csv, or the current directory when save_dir is empty."
+        ),
+        default=None,
     )
     parser.add_argument(
         "--ctrl_type",
