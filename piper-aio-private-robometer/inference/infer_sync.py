@@ -1,4 +1,5 @@
 import argparse
+import csv
 import os
 import signal
 import sys
@@ -6,6 +7,7 @@ import termios
 import threading
 import time
 import tty
+from datetime import datetime
 
 import numpy as np
 import rospy
@@ -30,6 +32,88 @@ if PROJECT_ROOT not in sys.path:
 from ros_operator import RosOperator
 
 shutdown_event = threading.Event()
+
+
+class ActiveInferenceTimer:
+    """Accumulate model-running wall time while excluding interactive pauses."""
+
+    def __init__(self):
+        self.started_at = datetime.now().astimezone().isoformat(timespec="milliseconds")
+        self.ended_at = None
+        self._active_started_at = time.monotonic()
+        self._elapsed = 0.0
+        self._running = True
+
+    def pause(self):
+        if self._running:
+            self._elapsed += time.monotonic() - self._active_started_at
+            self._running = False
+            self.ended_at = datetime.now().astimezone().isoformat(timespec="milliseconds")
+
+    def resume(self):
+        if not self._running:
+            self._active_started_at = time.monotonic()
+            self._running = True
+
+    def elapsed(self):
+        if self._running:
+            return self._elapsed + time.monotonic() - self._active_started_at
+        return self._elapsed
+
+
+class SavedRolloutTimingLogger:
+    """Append inference timing only after its corresponding rollout is saved."""
+
+    FIELDNAMES = (
+        "episode_index",
+        "task",
+        "inference_started_at",
+        "inference_ended_at",
+        "inference_duration_s",
+        "recorded_frames",
+        "hdf5_path",
+    )
+
+    def __init__(self, path, task):
+        self.path = os.path.abspath(os.path.expanduser(path))
+        self.task = task
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        print(f"Saved-rollout inference timing summary: {self.path}")
+
+    def append(self, episode_index, timer, recorded_frames, hdf5_path):
+        row = {
+            "episode_index": episode_index,
+            "task": self.task,
+            "inference_started_at": timer.started_at,
+            "inference_ended_at": timer.ended_at,
+            "inference_duration_s": f"{timer.elapsed():.3f}",
+            "recorded_frames": recorded_frames,
+            "hdf5_path": os.path.abspath(hdf5_path),
+        }
+        file_exists = os.path.isfile(self.path) and os.path.getsize(self.path) > 0
+        with open(self.path, "a", newline="", encoding="utf-8") as summary_file:
+            writer = csv.DictWriter(summary_file, fieldnames=self.FIELDNAMES)
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(row)
+            summary_file.flush()
+            os.fsync(summary_file.fileno())
+        print(
+            f"Inference timing saved for episode {episode_index}: "
+            f"{row['inference_duration_s']} seconds"
+        )
+
+
+def save_rollout_with_timing(recorder, timing_logger, timer):
+    """Prompt for save and append timing only when the operator chooses SAVE."""
+    timer.pause()
+    episode_index = recorder.episode_idx
+    recorded_frames = len(recorder.actions)
+    hdf5_path = os.path.join(recorder.save_dir, f"episode_{episode_index}.hdf5")
+    saved = recorder.save_episode()
+    if saved and timing_logger is not None:
+        timing_logger.append(episode_index, timer, recorded_frames, hdf5_path)
+    return saved
 
 
 def _on_sigint(signum, frame):
@@ -99,9 +183,12 @@ def model_inference(args, config, ros_operator):
             port=args.port,
             image_size=args.image_size,
             prompt=config["language_instruction"],
+            dashboard_port=args.robometer_dashboard_port if args.enable_robometer else None,
         )
     else:
         raise ValueError(f"Unknown model: {args.model}")
+
+    print(f"Live Robometer: {'enabled' if args.enable_robometer else 'disabled'}")
 
     max_publish_step = config["episode_len"]
     chunk_size = config["chunk_size"]
@@ -124,6 +211,12 @@ def model_inference(args, config, ros_operator):
     task_time = time.time()
     ros_operator.follower_arm_publish_continuous(left0, right0)
     recorder = InferenceDataRecorder(args, config, shutdown_event=shutdown_event)
+    timing_logger = None
+    if recorder.enabled:
+        timing_summary_path = args.inference_timing_summary or os.path.join(
+            recorder.save_dir, "rollout_inference_times.csv"
+        )
+        timing_logger = SavedRolloutTimingLogger(timing_summary_path, args.task)
     command_lock = threading.Lock()
     failure_monitor = _FailurePauseMonitor(policy, ros_operator, command_lock)
     failure_monitor.start()
@@ -139,16 +232,18 @@ def model_inference(args, config, ros_operator):
             action_buffer = np.zeros([chunk_size, config["state_dim"]])
             force_replan = True
             episode_closed = False
+            inference_timer = ActiveInferenceTimer()
 
             while t < max_publish_step and not rospy.is_shutdown() and not shutdown_event.is_set():
                 # Check for keyboard input (space to enter interactive mode)
                 failure_pause = failure_monitor.pause_event.is_set()
                 key = " " if failure_pause else check_keyboard_input()
                 if key == " ":
+                    inference_timer.pause()
                     result = handle_interactive_mode(task_time)
                     if result == "reset":
                         failure_monitor.clear_pause()
-                        recorder.save_episode()
+                        save_rollout_with_timing(recorder, timing_logger, inference_timer)
                         episode_closed = True
                         if not policy.reset_episode():
                             raise RuntimeError("Reset aborted: live Robometer episode could not be reset")
@@ -158,13 +253,14 @@ def model_inference(args, config, ros_operator):
                         task_time = time.time()
                         break  # Break inner loop to restart
                     elif result == "quit":
-                        recorder.save_episode()
+                        save_rollout_with_timing(recorder, timing_logger, inference_timer)
                         return  # Exit the function entirely
                     if failure_pause:
                         if not policy.resume_robometer():
                             raise RuntimeError("Continue aborted: live Robometer could not be resumed")
                         failure_monitor.clear_pause()
                     force_replan = True
+                    inference_timer.resume()
 
                 # When coming to the end of the action chunk
                 if force_replan or t % chunk_size == 0:
@@ -209,7 +305,7 @@ def model_inference(args, config, ros_operator):
                 rate.sleep()
 
             if not episode_closed:
-                recorder.save_episode()
+                save_rollout_with_timing(recorder, timing_logger, inference_timer)
             if shutdown_event.is_set():
                 return
     finally:
@@ -389,6 +485,12 @@ def get_arguments():
         required=False,
     )
     parser.add_argument(
+        "--inference_timing_summary",
+        type=str,
+        default=None,
+        help="CSV path for saved rollout inference times (default: <save_dir>/rollout_inference_times.csv)",
+    )
+    parser.add_argument(
         "--ctrl_type",
         type=str,
         choices=["joint", "eef"],
@@ -410,6 +512,17 @@ def get_arguments():
         help="Websocket server port",
         default=8000,
         required=False,
+    )
+    parser.add_argument(
+        "--enable_robometer",
+        action="store_true",
+        help="Enable Live Robometer monitoring and dashboard API calls (disabled by default)",
+    )
+    parser.add_argument(
+        "--robometer_dashboard_port",
+        type=int,
+        default=8080,
+        help="Live Robometer dashboard/API port used with --enable_robometer",
     )
     parser.add_argument(
         "--image_size",

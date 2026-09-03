@@ -90,7 +90,7 @@ class OpenpiClient:
         port: int,
         prompt: str,
         image_size=(224, 224),
-        dashboard_port: int | None = 8080,
+        dashboard_port: int | None = None,
     ) -> None:
 
         # build client to connect server policy

@@ -389,6 +389,7 @@ def model_inference(args, config, ros_operator):
             port=args.port,
             image_size=args.image_size,
             prompt=config["language_instruction"],
+            dashboard_port=args.robometer_dashboard_port if args.enable_robometer else None,
         )
     else:
         raise ValueError(f"Unknown model: {args.model}")
@@ -701,6 +702,8 @@ def get_arguments():
         default=8000,
         required=False,
     )
+    parser.add_argument("--enable_robometer", action="store_true", help="Enable Live Robometer (disabled by default)")
+    parser.add_argument("--robometer_dashboard_port", type=int, default=8080)
     parser.add_argument(
         "--image_size",
         type=int,

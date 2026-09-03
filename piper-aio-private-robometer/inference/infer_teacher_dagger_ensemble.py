@@ -951,6 +951,8 @@ def model_inference(args, config, ros_operator):
 
 
 def validate_args(args, parser):
+    if not args.enable_robometer:
+        parser.error("automatic Teacher DAgger requires Live Robometer; pass --enable_robometer")
     if args.chunk_size <= 0:
         parser.error("--chunk_size must be greater than 0")
     if args.exec_horizon < 1:
@@ -974,6 +976,11 @@ def validate_args(args, parser):
 
 def get_arguments():
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--enable_robometer",
+        action="store_true",
+        help="Enable Live Robometer (required for automatic Teacher DAgger)",
+    )
     parser.add_argument(
         "--max_publish_step",
         action="store",

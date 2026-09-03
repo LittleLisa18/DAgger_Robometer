@@ -3,6 +3,7 @@ eval "$(conda shell.bash hook)"
 conda activate piperaio
 
 exec python inference/infer_teacher_dagger_ensemble.py \
+  --enable_robometer \
   --model openpi \
   --host 127.0.0.1 \
   --port 8000 \

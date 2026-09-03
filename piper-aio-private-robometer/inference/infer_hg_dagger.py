@@ -363,14 +363,14 @@ def _reset_episode(policy, ros_operator, collector, recorder, timing_logger, lef
     """Close the current episode and reset every episode-scoped state."""
     collector.reset()
     reset_observation_window()
-    if not policy.reset_episode():
-        raise RuntimeError("Reset aborted: live Robometer episode could not be reset")
     episode_saved = recorder.save_episode()
     timing_logger.finish(
         success=episode_saved,
         end_reason="human_dagger_success" if episode_saved else "human_dagger_failure",
     )
     recorder.reset()
+    if not policy.reset_episode():
+        raise RuntimeError("Reset aborted: live Robometer episode could not be reset")
     ros_operator.move_arms_to_initial_pose(left0, right0)
     return _wait_after_reset(), episode_saved
 
@@ -426,8 +426,15 @@ def run_dagger_session(args, config, ros_operator, collector, recorder):
 
 def model_inference(args, config, ros_operator):
     policy = OpenpiClient(
-        host=args.host, port=args.port, image_size=args.image_size, prompt=config["language_instruction"]
+        host=args.host,
+        port=args.port,
+        image_size=args.image_size,
+        prompt=config["language_instruction"],
+        dashboard_port=args.robometer_dashboard_port if args.enable_robometer else None,
     )
+    print(f"Live Robometer: {'enabled' if args.enable_robometer else 'disabled'}")
+    if not args.enable_robometer:
+        print("Human DAgger will use manual SPACE intervention only")
 
     left0, right0 = config["left0"], config["right0"]
     ros_operator.move_arms_to_initial_pose(left0, right0)
@@ -620,6 +627,17 @@ def get_arguments():
     parser.add_argument("--ctrl_type", choices=["joint", "eef"], default="joint")
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument(
+        "--robometer_dashboard_port",
+        type=int,
+        default=8080,
+        help="Live Robometer dashboard/API port",
+    )
+    parser.add_argument(
+        "--enable_robometer",
+        action="store_true",
+        help="Enable Live Robometer monitoring and dashboard API calls (disabled by default)",
+    )
     parser.add_argument("--image_size", type=int, nargs=2, metavar=("HEIGHT", "WIDTH"), default=(224, 224))
     parser.add_argument("--task", type=str, required=True)
     parser.add_argument("--model", choices=["openpi"], default="openpi")

@@ -432,6 +432,11 @@ python inference/infer_hg_dagger.py \
   --timing_summary ~/data/human_dagger_timing_summary.csv
 ```
 
+Live Robometer is disabled by default, so Human DAgger relies only on the
+operator's `SPACE` intervention. Add `--enable_robometer` (and optionally
+`--robometer_dashboard_port 8080`) only when dashboard-based failure detection
+is required. Policy inference works normally while Robometer is disabled.
+
 Press `SPACE` when the Student fails, then select `d` to start Human DAgger.
 After completing the correction, exit DAgger collection with `c` and reset the
 episode with `r`. At the existing save prompt, `s` records a successful Human
@@ -465,6 +470,7 @@ Robometer dashboard/API ports, then use:
 
 ```bash
 python inference/infer_teacher_dagger_ensemble.py \
+  --enable_robometer \
   --task towel \
   --host 127.0.0.1 \
   --port 8000 \

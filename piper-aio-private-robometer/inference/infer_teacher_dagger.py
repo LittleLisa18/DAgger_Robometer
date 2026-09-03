@@ -68,12 +68,13 @@ class PolicySwitcher:
         return True
 
 
-def build_openpi_policy(host, port, args, config):
+def build_openpi_policy(host, port, dashboard_port, args, config):
     return OpenpiClient(
         host=host,
         port=port,
         image_size=args.image_size,
         prompt=config["language_instruction"],
+        dashboard_port=dashboard_port,
     )
 
 
@@ -84,8 +85,10 @@ def build_policy_switcher(args, config):
         raise ValueError(f"Unknown teacher model: {args.teacher_model}")
 
     teacher_host = args.teacher_host if args.teacher_host is not None else args.host
-    student_policy = build_openpi_policy(args.host, args.port, args, config)
-    teacher_policy = build_openpi_policy(teacher_host, args.teacher_port, args, config)
+    student_dashboard_port = args.student_dashboard_port if args.enable_robometer else None
+    teacher_dashboard_port = args.teacher_dashboard_port if args.enable_robometer else None
+    student_policy = build_openpi_policy(args.host, args.port, student_dashboard_port, args, config)
+    teacher_policy = build_openpi_policy(teacher_host, args.teacher_port, teacher_dashboard_port, args, config)
     return PolicySwitcher(student_policy, teacher_policy, args.initial_policy)
 
 
@@ -413,6 +416,9 @@ def get_arguments():
         default=8001,
         required=False,
     )
+    parser.add_argument("--enable_robometer", action="store_true", help="Enable Live Robometer (disabled by default)")
+    parser.add_argument("--student_dashboard_port", type=int, default=8080)
+    parser.add_argument("--teacher_dashboard_port", type=int, default=8081)
     parser.add_argument(
         "--image_size",
         type=int,
