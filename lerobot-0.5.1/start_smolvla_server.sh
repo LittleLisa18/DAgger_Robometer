@@ -2,7 +2,7 @@
 set -e
 cd "$(dirname "$0")"
 
-CHECKPOINT="/path/to/checkpoints/last/pretrained_model"
+CHECKPOINT="/media/sail/jinghua4T/ckpt_yantong/smolvla_pick_pen_0807/050000/pretrained_model"
 
 PYTHONPATH=src python -m lerobot.scripts.lerobot_serve_smolvla_piper \
   --checkpoint "$CHECKPOINT" \

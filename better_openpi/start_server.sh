@@ -1,7 +1,8 @@
+export OPENPI_DATA_HOME=/home/sail/.cache/openpi
+
 XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/serve_policy.py \
     policy:checkpoint \
-    --policy.config=pi05_agilex --policy.dir=/media/sail/jinghua4T/ckpt_yantong/pi05_fold_dishcloth_0623_0716/49999
-# XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/serve_policy.py \
+    --policy.config=pi05_vlm_agilex --policy.dir=/media/sail/jinghua4T/ckpt_yantong/pi05_vlm_fold_dishcloth_0716_fix/49999
 #     --use-custom-sample-kwargs \
 #     --infer-time-schedule=HAS \
 #     --alpha=0.6 \

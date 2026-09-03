@@ -1257,7 +1257,8 @@ _CONFIGS = [
         data=LeRobotAgilexDataConfig(
             repo_id="/home/ma-user/work/users/yantong/data/pick_pen_0807",
             base_config=DataConfig(prompt_from_task=True),
-            assets=AssetsConfig(asset_id="pick_pen_0807"),
+            assets=AssetsConfig(asset_id="fold_dishcloth_0716_fix"),
+            arm_mode="left",
         ),
         batch_size=128,
         num_workers=8,
@@ -1271,7 +1272,7 @@ _CONFIGS = [
         data=LeRobotAgilexDataConfig(
             repo_id="/houzhi_vepfs/luyuxiang/dataset/lerobot/fold_dishcloth_0515",
             base_config=DataConfig(prompt_from_task=True),
-            assets=AssetsConfig(asset_id="fold_dishcloth_0515"),
+            assets=AssetsConfig(asset_id="fold_dishcloth_0716_fix"),
         ),
         batch_size=128,
         num_workers=8,
@@ -1297,9 +1298,10 @@ _CONFIGS = [
         name="pi05_vlm_agilex",
         model=pi0_config.Pi0Config(pi05=True),
         data=LeRobotAgilexDataConfig(
-            repo_id="/home/ma-user/work/users/yantong/data/pick_pen_0807",
+            repo_id="/home/ma-user/work/users/yantong/data/fold_dishcloth_0716_fix",
             base_config=DataConfig(prompt_from_task=True),
-            assets=AssetsConfig(asset_id="pick_pen_0807"),
+            assets=AssetsConfig(asset_id="fold_dishcloth_0716_fix"),
+            arm_mode="left",
         ),
         batch_size=128,
         num_workers=8,
@@ -1488,7 +1490,8 @@ _CONFIGS = [
         data=LeRobotAgilexDataConfig(
             repo_id="/houzhi_vepfs/luyuxiang/dataset/lerobot/fold_dishcloth_0515",
             base_config=DataConfig(prompt_from_task=True),
-            assets=AssetsConfig(asset_id="fold_dishcloth_0515"),
+            assets=AssetsConfig(asset_id="fold_dishcloth_0716_fix"),
+            arm_mode="left",
         ),
         # Student is initialized from the VLM base weights.
         weight_loader=weight_loaders.PaliGemmaWeightLoader(),
