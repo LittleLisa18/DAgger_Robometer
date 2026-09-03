@@ -1498,6 +1498,7 @@ _CONFIGS = [
         distill_config=DistillConfig(
             # Path to the fine-tuned teacher checkpoint params directory.
             teacher_checkpoint="checkpoints/pi05_agilex/pi05_fold_dishcloth_0515/49999/params",
+            use_rollout_data=False,
             vit_weight=1.0,
             llm_weight=0.0,
             flow_weight=1.0,
