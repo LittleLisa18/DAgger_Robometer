@@ -151,7 +151,15 @@ def forward_model(
     model: Any, batch_inputs: Dict[str, Any], sample_type: str = "progress"
 ) -> Tuple[ModelOutput, Dict[str, Any]]:
     """Forward pass that mirrors trainer logic (handles ReWiND vs RBM)."""
-    with torch.no_grad():
+    device = next(model.parameters()).device
+    dtype = getattr(model, "_eval_autocast_dtype", torch.bfloat16)
+    # Autocast is thread-local: enter it in the executor's forward call, not
+    # during startup. Qwen/Unsloth can retain FP32 activations with BF16 weights.
+    with torch.no_grad(), torch.autocast(
+        device_type=device.type,
+        dtype=dtype if dtype in (torch.float16, torch.bfloat16) else torch.bfloat16,
+        enabled=device.type == "cuda" and dtype in (torch.float16, torch.bfloat16),
+    ):
         if "rewind" in model.__class__.__name__.lower():
             model_output, extra = model(
                 video_embeddings=batch_inputs.get("video_embeddings"),
@@ -388,6 +396,7 @@ class MultiGPUEvalServer:
 
             model = model.to(device)
             model.eval()
+            model._eval_autocast_dtype = getattr(torch, self.exp_config.model.torch_dtype)
 
             # Initialize GPU stats
             self.gpu_stats[gpu_id] = {
