@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="zh"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LIBERO 轨迹播放器</title>
+<style>
+body{margin:24px auto;padding:0 20px;max-width:1200px;background:#101821;color:#e8edf3;font:16px system-ui}a{color:#70d1ca}button,select,input{font:inherit}button,select{padding:8px;background:#28465b;color:white;border:0;border-radius:6px}button:disabled{opacity:.4}.bar{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:18px 0}.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.card{padding:16px;background:#192531;border-radius:12px}img{width:100%;object-fit:contain;max-height:400px;background:#080e15}#seek{width:100%;accent-color:#70d1ca}#actor{padding:6px 12px;border-radius:16px;background:#214851}#actor.teacher{background:#69401e;color:#ffcd85}#error{color:#ffaf9d}canvas{width:100%;height:210px}pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:260px;overflow:auto}.muted{color:#9aaebe}@media(max-width:700px){.grid{grid-template-columns:1fr}}
+</style>
+<header class="bar"><h1>轨迹播放器</h1><a href="/">返回采集仪表盘</a></header>
+<p class="muted">只读回放 · 画面为动作前观测 · 播放速度不代表实际控制频率</p>
+<label>Episode <select id="episode"><option>正在加载…</option></select></label>
+<h2 id="task"></h2><p id="notice"></p><p id="error" role="alert"></p>
+<div class="bar"><span id="actor">—</span><span id="position">请选择轨迹</span><span id="reason"></span></div>
+<div class="grid"><div class="card">主相机<img id="image" alt="主相机动作前观测"></div><div class="card">腕部相机<img id="image2" alt="腕部相机动作前观测"></div></div>
+<div class="bar"><button id="prev">上一帧</button><button id="play">播放</button><button id="next">下一帧</button><button id="takeover">跳到接管</button><label>播放速度 <select id="speed"><option value="2">2 帧/秒</option><option value="5">5 帧/秒</option><option value="10" selected>10 帧/秒</option><option value="20">20 帧/秒</option></select></label></div>
+<input id="seek" type="range" min="0" max="0" value="0" aria-label="播放帧位置">
+<p id="score" class="muted"></p><canvas id="chart"></canvas>
+<div class="grid"><div class="card">执行动作 [位置 3D、旋转 3D、夹爪]<pre id="action"></pre></div><div class="card">State [位置 3D、轴角 3D、夹爪关节 2D]<pre id="state"></pre></div></div>
+<details class="card"><summary>Episode 元数据</summary><pre id="metadata"></pre></details>
+<script src="/player.js"></script></html>
