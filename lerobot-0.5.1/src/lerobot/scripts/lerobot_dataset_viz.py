@@ -157,6 +157,16 @@ def visualize_dataset(
                 for dim_idx, val in enumerate(batch[OBS_STATE][i]):
                     rr.log(f"state/{dim_idx}", rr.Scalars(val.item()))
 
+            # Display per-frame collection labels or numeric flags on the same timeline.
+            if "collect" in batch:
+                value = batch["collect"][i]
+                if isinstance(value, torch.Tensor):
+                    value = value.item()
+                if isinstance(value, str):
+                    rr.log("collect", rr.TextLog(value))
+                else:
+                    rr.log("collect", rr.Scalars(float(value)))
+
             if DONE in batch:
                 rr.log(DONE, rr.Scalars(batch[DONE][i].item()))
 
