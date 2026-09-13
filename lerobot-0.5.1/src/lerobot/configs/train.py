@@ -25,6 +25,7 @@ from huggingface_hub.errors import HfHubHTTPError
 from lerobot import envs
 from lerobot.configs import parser
 from lerobot.configs.default import DatasetConfig, EvalConfig, PeftConfig, WandBConfig
+from lerobot.configs.distillation import DistillationConfig
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.optim import OptimizerConfig
 from lerobot.optim.schedulers import LRSchedulerConfig
@@ -69,6 +70,7 @@ class TrainPipelineConfig(HubMixin):
     eval: EvalConfig = field(default_factory=EvalConfig)
     wandb: WandBConfig = field(default_factory=WandBConfig)
     peft: PeftConfig | None = None
+    distillation: DistillationConfig | None = None
 
     # RA-BC (Reward-Aligned Behavior Cloning) parameters
     use_rabc: bool = False  # Enable reward-weighted training
@@ -112,6 +114,23 @@ class TrainPipelineConfig(HubMixin):
             raise ValueError(
                 "Policy is not configured. Please specify a pretrained policy with `--policy.path`."
             )
+
+        if self.dataset.sources is not None and self.distillation is None:
+            raise ValueError("dataset.sources is currently supported only for AutoDAgger distillation")
+
+        if self.distillation is not None:
+            self.distillation.validate(self)
+            if self.resume:
+                import json
+
+                saved = json.loads(Path(parser.parse_arg("config_path")).read_text())
+                old = saved.get("distillation") or {}
+                if old.get("teacher_id") != self.distillation.teacher_id:
+                    raise ValueError("Cannot change teacher_id when resuming distillation")
+                if saved["policy"]["chunk_size"] != self.policy.chunk_size:
+                    raise ValueError("Cannot change student chunk_size when resuming distillation")
+                if old.get("dataset_fingerprint") != self.distillation.dataset_fingerprint:
+                    raise ValueError("Cannot override the saved dataset fingerprint on resume")
 
         if not self.job_name:
             if self.env is None:

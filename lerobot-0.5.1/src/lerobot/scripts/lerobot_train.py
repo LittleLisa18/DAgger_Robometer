@@ -66,6 +66,7 @@ def update_policy(
     lr_scheduler=None,
     lock=None,
     rabc_weights_provider=None,
+    distillation_config=None,
 ) -> tuple[MetricsTracker, dict]:
     """
     Performs a single training step to update the policy's weights.
@@ -101,7 +102,16 @@ def update_policy(
     # Let accelerator handle mixed precision
     with accelerator.autocast():
         # Use per-sample loss when RA-BC is enabled for proper weighting
-        if rabc_batch_weights is not None:
+        if distillation_config is not None:
+            from lerobot.utils.distillation import distillation_loss
+
+            # Call the wrapped module (not its underlying forward) so DDP hooks run.
+            errors, _ = policy(batch, reduction="elements")
+            loss, output_dict = distillation_loss(
+                errors, batch["distill_bc_mask"], accelerator, distillation_config
+            )
+            output_dict.update(batch["distill_request_metrics"])
+        elif rabc_batch_weights is not None:
             # Get per-sample losses
             per_sample_loss, output_dict = policy.forward(batch, reduction="none")
 
@@ -143,7 +153,7 @@ def update_policy(
     if has_method(accelerator.unwrap_model(policy, keep_fp32_wrapper=True), "update"):
         accelerator.unwrap_model(policy, keep_fp32_wrapper=True).update()
 
-    train_metrics.loss = loss.item()
+    train_metrics.loss = output_dict["loss"] if distillation_config is not None else loss.item()
     train_metrics.grad_norm = grad_norm.item()
     train_metrics.lr = optimizer.param_groups[0]["lr"]
     train_metrics.update_s = time.perf_counter() - start_time
@@ -216,16 +226,35 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
 
-    # Dataset loading synchronization: main process downloads first to avoid race conditions
-    if is_main_process:
-        logging.info("Creating dataset")
-        dataset = make_dataset(cfg)
+    if cfg.distillation is not None:
+        from lerobot.datasets.autodagger_distillation import make_distillation_dataset
 
-    accelerator.wait_for_everyone()
-
-    # Now all other processes can safely load the dataset
-    if not is_main_process:
-        dataset = make_dataset(cfg)
+        error = None
+        try:
+            # Local exports are read independently; loading/audit failures are synchronized too.
+            dataset = make_distillation_dataset(cfg)
+            recorded = cfg.distillation.dataset_fingerprint
+            if cfg.resume and recorded != dataset.fingerprint:
+                raise ValueError("Dataset content/episode selection changed since the saved checkpoint")
+            cfg.distillation.dataset_fingerprint = dataset.fingerprint
+        except Exception as exc:
+            error = exc
+        failed = accelerator.reduce(torch.tensor(int(error is not None), device=device), reduction="sum")
+        if failed.item():
+            raise RuntimeError(f"AutoDAgger validation failed; local error: {error!r}") from error
+        # Generic checkpoints carry camera/state features from their pretraining data.
+        # The padded SmolVLA projections can load those weights with LIBERO features.
+        if not cfg.resume:
+            cfg.policy.input_features = {}
+        cfg.policy.device = str(device)
+    else:
+        # Main process downloads first to avoid races in ordinary Hub-backed training.
+        if is_main_process:
+            logging.info("Creating dataset")
+            dataset = make_dataset(cfg)
+        accelerator.wait_for_everyone()
+        if not is_main_process:
+            dataset = make_dataset(cfg)
 
     # Create environment used for evaluating checkpoints during training on simulation data.
     # On real-world data, no need to create an environment as evaluations are done outside train.py,
@@ -253,6 +282,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     accelerator.wait_for_everyone()
 
     processor_pretrained_path = cfg.policy.pretrained_path
+    if cfg.distillation is not None and not cfg.resume:
+        processor_pretrained_path = None
     if (
         getattr(cfg.policy, "use_relative_actions", False)
         and processor_pretrained_path is not None
@@ -294,6 +325,11 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 "norm_map": policy.config.normalization_mapping,
             },
         }
+
+    if cfg.distillation is not None and cfg.resume:
+        # Reload checkpoint normalization unchanged; remap only the rank-local device.
+        processor_kwargs = {"preprocessor_overrides": {"device_processor": {"device": str(device)}}}
+        postprocessor_kwargs = {}
 
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=cfg.policy,
@@ -388,6 +424,15 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
     policy.train()
 
+    teacher_client = None
+    if cfg.distillation is not None:
+        import atexit
+
+        from lerobot.utils.distillation import OpenPITeacherClient
+
+        teacher_client = OpenPITeacherClient(cfg.distillation)
+        atexit.register(teacher_client.close)
+
     train_metrics = {
         "loss": AverageMeter("loss", ":.3f"),
         "grad_norm": AverageMeter("grdn", ":.3f"),
@@ -423,7 +468,12 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     for _ in range(step, cfg.steps):
         start_time = time.perf_counter()
         batch = next(dl_iter)
-        batch = preprocessor(batch)
+        if teacher_client is not None:
+            from lerobot.utils.distillation import prepare_distillation_batch
+
+            batch = prepare_distillation_batch(batch, preprocessor, teacher_client, accelerator)
+        else:
+            batch = preprocessor(batch)
         train_tracker.dataloading_s = time.perf_counter() - start_time
 
         train_tracker, output_dict = update_policy(
@@ -435,6 +485,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             accelerator=accelerator,
             lr_scheduler=lr_scheduler,
             rabc_weights_provider=rabc_weights,
+            distillation_config=cfg.distillation,
         )
 
         # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
@@ -449,6 +500,13 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
         if is_log_step:
             logging.info(train_tracker)
+            if cfg.distillation is not None:
+                import json
+
+                logging.info("Distillation: %s", output_dict)
+                cfg.output_dir.mkdir(parents=True, exist_ok=True)
+                with (cfg.output_dir / "distillation_metrics.jsonl").open("a") as stream:
+                    stream.write(json.dumps({"step": step, **output_dict}) + "\n")
             if wandb_logger:
                 wandb_log_dict = train_tracker.to_dict()
                 if output_dict:
@@ -537,6 +595,10 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
     if is_main_process:
         progbar.close()
+
+    if teacher_client is not None:
+        teacher_client.close()
+        atexit.unregister(teacher_client.close)
 
     if eval_env:
         close_envs(eval_env)

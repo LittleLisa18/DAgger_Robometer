@@ -15,18 +15,44 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from lerobot.datasets.transforms import ImageTransformsConfig
 from lerobot.datasets.video_utils import get_safe_default_codec
 
 
 @dataclass
-class DatasetConfig:
-    # You may provide a list of datasets here. `train.py` creates them all and concatenates them. Note: only data
-    # keys common between the datasets are kept. Each dataset gets and additional transform that inserts the
-    # "dataset_index" into the returned item. The index mapping is made according to the order in which the
-    # datasets are provided.
+class DatasetSourceConfig:
+    """One local AutoDAgger export; episode indices belong to this source only."""
+
     repo_id: str
+    root: str
+    episodes: list[int] | None = None
+    revision: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.repo_id or not self.root:
+            raise ValueError("Each dataset source requires repo_id and a local root")
+        if self.episodes == []:
+            raise ValueError("Dataset source episodes must be nonempty or null")
+        _validate_episodes(self.episodes)
+
+
+def _validate_episodes(episodes: list[int] | None) -> None:
+    if episodes is not None:
+        if any(ep < 0 for ep in episodes):
+            raise ValueError(
+                f"Episode indices must be non-negative, got: {[ep for ep in episodes if ep < 0]}"
+            )
+        if len(episodes) != len(set(episodes)):
+            duplicates = sorted({ep for ep in episodes if episodes.count(ep) > 1})
+            raise ValueError(f"Episode indices contain duplicates: {duplicates}")
+
+
+@dataclass
+class DatasetConfig:
+    # Use repo_id/root for one dataset, or sources for multi-dataset distillation.
+    repo_id: str | None = None
     # Root directory for a concrete local dataset tree (e.g. 'dataset/path'). If None, local datasets are
     # looked up under $HF_LEROBOT_HOME/repo_id and Hub downloads use a revision-safe cache under $HF_LEROBOT_HOME/hub.
     root: str | None = None
@@ -36,16 +62,20 @@ class DatasetConfig:
     use_imagenet_stats: bool = True
     video_backend: str = field(default_factory=get_safe_default_codec)
     streaming: bool = False
+    sources: list[DatasetSourceConfig] | None = None
 
     def __post_init__(self) -> None:
-        if self.episodes is not None:
-            if any(ep < 0 for ep in self.episodes):
-                raise ValueError(
-                    f"Episode indices must be non-negative, got: {[ep for ep in self.episodes if ep < 0]}"
-                )
-            if len(self.episodes) != len(set(self.episodes)):
-                duplicates = sorted({ep for ep in self.episodes if self.episodes.count(ep) > 1})
-                raise ValueError(f"Episode indices contain duplicates: {duplicates}")
+        _validate_episodes(self.episodes)
+        if self.sources is not None:
+            if not self.sources:
+                raise ValueError("dataset.sources must be nonempty")
+            if any(value is not None for value in (self.repo_id, self.root, self.episodes, self.revision)):
+                raise ValueError("Use either dataset.sources or top-level repo_id/root/episodes/revision")
+            roots = [Path(source.root).expanduser().resolve() for source in self.sources]
+            if len(roots) != len(set(roots)):
+                raise ValueError("Duplicate dataset source roots would sample the same data twice")
+        elif not self.repo_id:
+            raise ValueError("Specify dataset.repo_id or dataset.sources")
 
 
 @dataclass

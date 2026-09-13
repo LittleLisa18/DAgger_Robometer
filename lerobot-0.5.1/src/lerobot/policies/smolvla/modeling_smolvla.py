@@ -364,6 +364,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
             reduction: How to reduce the loss. Options:
                 - "mean": Return scalar mean loss (default, backward compatible)
                 - "none": Return per-sample losses of shape (batch_size,) for RA-BC weighting
+                - "elements": Return unmasked errors (B, chunk_size, action_dim), for custom loss masks
         """
         if self.config.adapt_to_pi_aloha:
             batch[OBS_STATE] = self._pi_aloha_decode_state(batch[OBS_STATE])
@@ -379,6 +380,8 @@ class SmolVLAPolicy(PreTrainedPolicy):
         losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
         original_action_dim = self.config.action_feature.shape[0]
         losses = losses[:, :, :original_action_dim]
+        if reduction == "elements":
+            return losses, {}
         loss_dict["losses_after_forward"] = losses.clone().mean().item()
 
         if actions_is_pad is not None:
