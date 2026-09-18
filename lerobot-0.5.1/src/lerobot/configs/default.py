@@ -23,14 +23,17 @@ from lerobot.datasets.video_utils import get_safe_default_codec
 
 @dataclass
 class DatasetSourceConfig:
-    """One local AutoDAgger export; episode indices belong to this source only."""
+    """One local training source; episode indices belong to this source only."""
 
     repo_id: str
     root: str
     episodes: list[int] | None = None
     revision: str | None = None
+    supervision: str = "autodagger"
 
     def __post_init__(self) -> None:
+        if self.supervision not in ("autodagger", "demonstration"):
+            raise ValueError("Source supervision must be autodagger or demonstration")
         if not self.repo_id or not self.root:
             raise ValueError("Each dataset source requires repo_id and a local root")
         if self.episodes == []:

@@ -16,8 +16,30 @@ from torch.utils.data import Dataset
 from lerobot.datasets.compute_stats import aggregate_stats
 
 
+def _model_features(features):
+    """Compare decoded model inputs, allowing LeRobot's legacy HWC video metadata."""
+    result = {}
+    for key, feature in features.items():
+        if key != "action" and not key.startswith("observation."):
+            continue
+        if key.startswith("observation.images."):
+            shape = tuple(feature.get("shape", ()))
+            names = feature.get("names") or []
+            # Match dataset_to_policy_features; decoders already produce CHW tensors.
+            if len(shape) == 3 and len(names) == 3 and names[2] in ("channel", "channels"):
+                shape = (shape[2], shape[0], shape[1])
+            result[key] = {"shape": shape, "dtype": "visual"}
+        else:
+            result[key] = feature
+    return result
+
+
 class AutoDAggerDistillationDataset(Dataset):
-    def __init__(self, dataset, chunk_size: int):
+    def __init__(self, dataset, chunk_size: int, supervision: str = "autodagger"):
+        if supervision not in ("autodagger", "demonstration"):
+            raise ValueError("Unknown distillation supervision mode")
+        self.supervision = supervision
+        demonstration = supervision == "demonstration"
         if not 1 <= chunk_size <= 10:
             raise ValueError("Student chunk_size must be between 1 and 10")
         self.dataset = dataset
@@ -28,6 +50,7 @@ class AutoDAggerDistillationDataset(Dataset):
         self.num_frames = dataset.num_frames
         self.num_episodes = dataset.num_episodes
         features = self.meta.features
+        model_features = _model_features(features)
         expected = {
             "observation.images.image": (3, 256, 256),
             "observation.images.image2": (3, 256, 256),
@@ -37,20 +60,24 @@ class AutoDAggerDistillationDataset(Dataset):
         if self.meta.fps != 10:
             raise ValueError("AutoDAgger LIBERO data must use 10 FPS")
         for key, shape in expected.items():
-            if tuple(features.get(key, {}).get("shape", ())) != shape:
-                raise ValueError(f"Expected {key} shape {shape}")
-        if "collect" not in features:
+            actual = tuple(model_features.get(key, {}).get("shape", ()))
+            if actual != shape:
+                raise ValueError(f"Expected {key} decoded shape {shape}, got {actual}")
+        if demonstration and ("collect" in features or "collect" in dataset.hf_dataset.column_names):
+            raise ValueError(
+                "demonstration sources must not contain collect; use autodagger for labeled data"
+            )
+        if not demonstration and "collect" not in features:
             raise ValueError("AutoDAgger dataset is missing collect labels")
         if dataset.delta_timestamps.get("action") != [i / 10 for i in range(chunk_size)]:
             raise ValueError("Action delta timestamps must match the student chunk at 10 FPS")
 
         # Read columns only: never decode every camera image to construct masks.
-        columns = dataset.hf_dataset.select_columns(["index", "episode_index", "collect"]).with_format(None)[
-            :
-        ]
+        column_names = ["index", "episode_index"] + ([] if demonstration else ["collect"])
+        columns = dataset.hf_dataset.select_columns(column_names).with_format(None)[:]
         self.indices = np.asarray(columns["index"], dtype=np.int64)
         self.episode_indices = np.asarray(columns["episode_index"], dtype=np.int64)
-        labels = columns["collect"]
+        labels = ["teacher"] * len(self.indices) if demonstration else columns["collect"]
         if not labels or any(label not in ("rollout", "teacher") for label in labels):
             raise ValueError("collect must contain only rollout or teacher")
         self.teacher = np.asarray([label == "teacher" for label in labels])
@@ -58,13 +85,13 @@ class AutoDAggerDistillationDataset(Dataset):
             raise ValueError("Duplicate absolute frame indices")
 
         audit_path = self.root / "meta/autodagger_episodes.json"
-        audits = json.loads(audit_path.read_text())
+        audits = [] if demonstration else json.loads(audit_path.read_text())
         by_episode = {row["dataset_episode_index"]: row for row in audits}
         if len(by_episode) != len(audits):
             raise ValueError("Duplicate episode indices in AutoDAgger audit")
         for episode, count in Counter(self.episode_indices.tolist()).items():
             row = by_episode.get(episode, {})
-            if not (
+            if not demonstration and not (
                 row.get("accepted_for_distillation") is True
                 and row.get("took_over") is True
                 and row.get("robometer_success") is True
@@ -87,6 +114,8 @@ class AutoDAggerDistillationDataset(Dataset):
 
         # Content hashes also catch in-place data/normalization changes on resume.
         digest = hashlib.sha256()
+        if demonstration:
+            digest.update(b"demonstration-kd-bc-v1")
         paths = [
             self.root / f"meta/{name}"
             for name in (
@@ -97,6 +126,8 @@ class AutoDAggerDistillationDataset(Dataset):
                 "tasks.parquet",
             )
         ]
+        if demonstration:
+            paths = [path for path in paths if not path.name.startswith("autodagger_")]
         paths += sorted((self.root / "data").rglob("*.parquet"))
         paths += sorted((self.root / "meta/episodes").rglob("*.parquet"))
         paths += sorted((self.root / "videos").rglob("*.mp4"))
@@ -181,8 +212,12 @@ class MultiAutoDAggerDistillationDataset(Dataset):
             raise ValueError("At least one AutoDAgger dataset is required")
         self.datasets = datasets
         first = datasets[0]
+
         for source in datasets[1:]:
-            if source.meta.features != first.meta.features or source.meta.fps != first.meta.fps:
+            if (
+                _model_features(source.meta.features) != _model_features(first.meta.features)
+                or source.meta.fps != first.meta.fps
+            ):
                 raise ValueError("AutoDAgger sources must have matching feature schemas and FPS")
             if source.chunk_size != first.chunk_size:
                 raise ValueError("AutoDAgger sources must use the same student chunk_size")
@@ -210,8 +245,12 @@ class MultiAutoDAggerDistillationDataset(Dataset):
 
         import datasets as hf_datasets
 
+        # Auxiliary collection fields may be absent from ordinary demonstrations.
+        self.common_features = set.intersection(*(set(source.meta.features) for source in datasets))
         self.meta = SimpleNamespace(
-            features=first.meta.features,
+            features={
+                key: value for key, value in first.meta.features.items() if key in self.common_features
+            },
             fps=first.meta.fps,
             camera_keys=first.meta.camera_keys,
             stats=aggregate_stats([selected_normalization_stats(source.dataset) for source in datasets]),
@@ -241,6 +280,11 @@ class MultiAutoDAggerDistillationDataset(Dataset):
         source = self.datasets[source_index]
         local_index = index - offset
         item = source[local_index]
+        item = {
+            key: value
+            for key, value in item.items()
+            if key in self.common_features or key in ("task", "distill_bc_mask") or key.endswith("_is_pad")
+        }
         episode = int(source.episode_indices[local_index])
         return {
             **item,
@@ -278,7 +322,8 @@ def make_distillation_dataset(cfg):
         if not (root / "meta/info.json").is_file():
             raise ValueError(f"Dataset source {index} is not a local LeRobot export: {root}")
         source_cfg = replace(cfg, dataset=replace(dataset_config, root=str(root)))
-        source = AutoDAggerDistillationDataset(make_dataset(source_cfg), cfg.policy.chunk_size)
+        supervision = sources[index].supervision if sources is not None else "autodagger"
+        source = AutoDAggerDistillationDataset(make_dataset(source_cfg), cfg.policy.chunk_size, supervision)
         logging.info(
             "AutoDAgger source %d: %s (%s), %d frames, %d episodes",
             index,

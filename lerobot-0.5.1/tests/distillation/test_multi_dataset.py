@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import draccus
 import numpy as np
@@ -77,12 +78,100 @@ class NumericDataset(FakeDataset):
             "index": torch.tensor(row["index"]),
             "episode_index": torch.tensor(row["episode_index"]),
             "action_is_pad": torch.zeros(3, dtype=torch.bool),
-            "collect": row["collect"],
+            **({"collect": row["collect"]} if "collect" in row else {}),
             "task": str(self.root.name),
         }
 
 
 class MultiDatasetTests(unittest.TestCase):
+    def test_legacy_hwc_metadata_and_mixed_layouts(self):
+        with tempfile.TemporaryDirectory() as temp:
+            chw = NumericDataset(Path(temp) / "chw", 0)
+            hwc = self.demonstration(Path(temp) / "hwc")
+            for key in hwc.meta.camera_keys:
+                hwc.meta.features[key].update(
+                    dtype="video", shape=[256, 256, 3], names=["height", "width", "channel"]
+                )
+            original = json.loads(json.dumps(hwc.meta.features))
+            sources = [
+                AutoDAggerDistillationDataset(chw, 3),
+                AutoDAggerDistillationDataset(hwc, 3, "demonstration"),
+            ]
+            ds = MultiAutoDAggerDistillationDataset(sources)
+            self.assertEqual(len(ds), 14)
+            self.assertTrue(ds[7]["distill_bc_mask"].all())
+            self.assertEqual(hwc.meta.features, original)
+            hwc.meta.features["observation.images.image"]["shape"] = [128, 256, 3]
+            with self.assertRaisesRegex(ValueError, "decoded shape"):
+                AutoDAggerDistillationDataset(hwc, 3, "demonstration")
+
+    def demonstration(self, root):
+        ds = NumericDataset(root, 100)
+        ds.meta.features.pop("collect")
+        ds.hf_dataset = ds.hf_dataset.remove_columns("collect")
+        for name in ("autodagger_episodes.json", "autodagger_run.json"):
+            (root / "meta" / name).unlink()
+        return ds
+
+    def test_demonstration_without_labels_or_audit(self):
+        with tempfile.TemporaryDirectory() as temp:
+            raw = self.demonstration(Path(temp) / "demo")
+            ds = AutoDAggerDistillationDataset(raw, 3, supervision="demonstration")
+            self.assertEqual(ds[0]["distill_bc_mask"].tolist(), [True, True, True])
+            self.assertEqual(ds[4]["distill_bc_mask"].tolist(), [True, False, False])
+            self.assertEqual(ds[6]["distill_bc_mask"].tolist(), [True, False, False])
+            self.assertNotIn("collect", ds[0])
+            with self.assertRaisesRegex(ValueError, "missing collect"):
+                AutoDAggerDistillationDataset(raw, 3)
+
+    def test_mixed_batch_in_both_source_orders(self):
+        with tempfile.TemporaryDirectory() as temp:
+            demo = AutoDAggerDistillationDataset(self.demonstration(Path(temp) / "demo"), 3, "demonstration")
+            auto = AutoDAggerDistillationDataset(NumericDataset(Path(temp) / "auto", 0), 3)
+            # Collection-only features must not prevent mixing standard demonstrations.
+            auto.meta.features["collection_score"] = {"shape": [1]}
+            for sources in ([auto, demo], [demo, auto]):
+                ds = MultiAutoDAggerDistillationDataset(sources)
+                batch = next(iter(torch.utils.data.DataLoader(ds, batch_size=14)))
+                self.assertNotIn("collect", batch)
+                self.assertNotIn("collect", ds.meta.features)
+                self.assertNotIn("collection_score", ds.meta.features)
+                demo_start = 7 if sources[0] is auto else 0
+                auto_start = 0 if sources[0] is auto else 7
+                self.assertTrue(batch["distill_bc_mask"][demo_start].all())
+                self.assertFalse(batch["distill_bc_mask"][auto_start].any())
+                self.assertEqual(batch["distill_bc_mask"][6].tolist(), [True, False, False])
+
+    def test_demonstration_does_not_override_existing_labels(self):
+        with tempfile.TemporaryDirectory() as temp:
+            raw = NumericDataset(Path(temp) / "labeled", 0)
+            with self.assertRaisesRegex(ValueError, "must not contain collect"):
+                AutoDAggerDistillationDataset(raw, 3, "demonstration")
+        cfg = draccus.decode(
+            DatasetConfig,
+            {"sources": [{"repo_id": "local/demo", "root": "/data/demo", "supervision": "demonstration"}]},
+        )
+        self.assertEqual(cfg.sources[0].supervision, "demonstration")
+        with self.assertRaises(ValueError):
+            DatasetSourceConfig(repo_id="local/demo", root="/data/demo", supervision="typo")
+
+    def test_demonstration_padding_and_integrity(self):
+        with tempfile.TemporaryDirectory() as temp:
+            raw = self.demonstration(Path(temp) / "demo")
+            ds = AutoDAggerDistillationDataset(raw, 3, "demonstration")
+            with patch.object(
+                NumericDataset,
+                "__getitem__",
+                return_value={"action_is_pad": torch.tensor([False, True, False])},
+            ):
+                self.assertEqual(ds[0]["distill_bc_mask"].tolist(), [True, False, True])
+            before = ds.fingerprint
+            (raw.root / "meta/stats.json").write_text('{"updated": true}')
+            self.assertNotEqual(before, AutoDAggerDistillationDataset(raw, 3, "demonstration").fingerprint)
+            raw.meta.episodes[2]["dataset_to_index"] = 16
+            with self.assertRaisesRegex(ValueError, "metadata bounds"):
+                AutoDAggerDistillationDataset(raw, 3, "demonstration")
+
     def test_colliding_local_indices_and_source_boundaries(self):
         with tempfile.TemporaryDirectory() as temp:
             sources = [
