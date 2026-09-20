@@ -12,7 +12,7 @@ import numpy as np
 import rospy
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from clients import OpenpiClient
+from clients import OpenpiClient, XvlaClient
 from utils import (
     InferenceDataRecorder,
     apply_fixed_arms_to_initial_pose,
@@ -391,6 +391,18 @@ def model_inference(args, config, ros_operator):
             prompt=config["language_instruction"],
             dashboard_port=args.robometer_dashboard_port if args.enable_robometer else None,
         )
+    elif args.model == "xvla":
+        if args.mode != "naive":
+            raise ValueError("X-VLA async inference currently supports only --mode naive")
+        if args.streaming:
+            raise ValueError("X-VLA async inference does not support --streaming")
+        policy = XvlaClient(
+            host=args.host,
+            port=args.port,
+            prompt=config["language_instruction"],
+            chunk_size=config["chunk_size"],
+            dashboard_port=args.robometer_dashboard_port if args.enable_robometer else None,
+        )
     else:
         raise ValueError(f"Unknown model: {args.model}")
 
@@ -404,7 +416,10 @@ def model_inference(args, config, ros_operator):
     ros_operator.follower_arm_publish_continuous(left0, right0)
 
     print("Warmup the server...")
-    policy.warmup(rtc=(args.mode == "rtc"), streaming=args.streaming)
+    if args.model == "xvla":
+        policy.warmup()
+    else:
+        policy.warmup(rtc=(args.mode == "rtc"), streaming=args.streaming)
     print("Server warmed up")
 
     input("Press enter to continue")
@@ -431,6 +446,8 @@ def model_inference(args, config, ros_operator):
             begin_new_episode(wait_timeout=5.0)
             reset_observation_window()
             action_buffer.reset()
+            if args.model == "xvla":
+                policy.reset()
 
             inference_stamp = 0
             episode_closed = False
@@ -690,7 +707,7 @@ def get_arguments():
         "--host",
         action="store",
         type=str,
-        help="Websocket server host",
+        help="Policy server host",
         default="127.0.0.1",
         required=False,
     )
@@ -698,7 +715,7 @@ def get_arguments():
         "--port",
         action="store",
         type=int,
-        help="Websocket server port",
+        help="Policy server port",
         default=8000,
         required=False,
     )
@@ -751,7 +768,7 @@ def get_arguments():
     parser.add_argument(
         "--model",
         type=str,
-        choices=["openpi"],
+        choices=["openpi", "xvla"],
         help="Model to use",
         default="openpi",
         required=False,
