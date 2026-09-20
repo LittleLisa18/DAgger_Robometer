@@ -229,6 +229,9 @@ class OpenpiClient:
             "prompt": payload["instruction"],
         }
 
+        if "step" in payload:
+            observation["step"] = payload["step"]
+
         if "action_prefix" in payload and payload["action_prefix"] is not None:
             observation["action_prefix"] = payload["action_prefix"]
             observation["delay"] = payload["delay"]
@@ -260,3 +263,111 @@ class OpenpiClient:
             self.client.infer(_random_observation(self.image_size, self.prompt))
             if rtc:
                 self.client.infer(_random_observation_rtc(self.image_size, self.prompt))
+
+
+class XvlaClient(OpenpiClient):
+    """X-VLA HTTP client that keeps the existing optional Robometer integration."""
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        prompt: str,
+        chunk_size: int,
+        dashboard_port: int | None = None,
+    ) -> None:
+        if chunk_size <= 0:
+            raise ValueError("X-VLA chunk_size must be positive")
+
+        import json_numpy
+        import requests
+
+        self._json_numpy = json_numpy
+        self._requests = requests
+        self.url = f"http://{host}:{port}/act"
+        self.prompt = prompt
+        self.chunk_size = chunk_size
+
+        # Keep the same optional dashboard contract as OpenpiClient so all
+        # existing Robometer monitoring, reset, pause, and preview paths work.
+        self.dashboard_reset_url = (
+            f"http://{host}:{dashboard_port}/api/reset" if dashboard_port is not None else None
+        )
+        self.dashboard_standby_url = (
+            f"http://{host}:{dashboard_port}/api/standby" if dashboard_port is not None else None
+        )
+        self.dashboard_state_url = (
+            f"http://{host}:{dashboard_port}/api/state" if dashboard_port is not None else None
+        )
+        self.dashboard_pause_url = (
+            f"http://{host}:{dashboard_port}/api/pause" if dashboard_port is not None else None
+        )
+        self.dashboard_resume_url = (
+            f"http://{host}:{dashboard_port}/api/resume" if dashboard_port is not None else None
+        )
+        self._failure_latched = False
+        self._last_failure_check = 0.0
+        self.preview = (
+            _DashboardPreviewSender(f"http://{host}:{dashboard_port}/api/preview")
+            if dashboard_port is not None
+            else None
+        )
+        self.reset()
+
+    def reset(self) -> None:
+        """Reset X-VLA predicted-proprio recursion for a new episode."""
+        self.pred_proprio = None
+
+    def reset_episode(self) -> bool:
+        self.reset()
+        return super().reset_episode()
+
+    def _request_actions(self, payload, proprio) -> np.ndarray:
+        proprio = np.asarray(proprio, dtype=np.float32)
+        if proprio.shape != (14,) or not np.isfinite(proprio).all():
+            raise ValueError("X-VLA proprio must contain 14 finite joint values")
+
+        if self.preview is not None:
+            self.preview.submit(payload["top"])
+
+        query = {
+            "proprio": self._json_numpy.dumps(proprio),
+            "image0": self._json_numpy.dumps(payload["top"]),
+            "image1": self._json_numpy.dumps(payload["left"]),
+            "image2": self._json_numpy.dumps(payload["right"]),
+            "language_instruction": payload["instruction"],
+            "steps": 10,
+            "domain_id": 20,
+        }
+        response = self._requests.post(self.url, json=query, timeout=60)
+        response.raise_for_status()
+        body = response.json()
+        if not isinstance(body, dict) or "action" not in body:
+            raise ValueError("X-VLA response is missing 'action'")
+
+        actions = np.asarray(body["action"], dtype=np.float32)
+        if actions.ndim != 2 or actions.shape[1] != 14:
+            raise ValueError(f"X-VLA actions must have shape (T, 14), got {actions.shape}")
+        if actions.shape[0] < self.chunk_size:
+            raise ValueError(
+                f"X-VLA action chunk length {actions.shape[0]} is smaller than {self.chunk_size}"
+            )
+        if not np.isfinite(actions).all():
+            raise ValueError("X-VLA actions must contain only finite values")
+        return actions[: self.chunk_size].copy()
+
+    def predict_action(self, payload) -> np.ndarray:
+        proprio = payload["state"] if self.pred_proprio is None else self.pred_proprio
+        actions = self._request_actions(payload, proprio)
+        # Match the upstream X-VLA behavior: recurse from the raw model output
+        # before task-specific action postprocessing is applied by the runner.
+        self.pred_proprio = actions[-1].copy()
+        return actions
+
+    def warmup(self) -> None:
+        payload = {
+            name: np.zeros((480, 640, 3), dtype=np.uint8)
+            for name in ("top", "left", "right")
+        }
+        payload["instruction"] = self.prompt
+        self._request_actions(payload, np.zeros(14, dtype=np.float32))

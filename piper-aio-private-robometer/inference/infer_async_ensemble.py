@@ -116,7 +116,7 @@ def update_observation_window(args, config, ros_operator):
     return True
 
 
-def build_policy_payload(args, config):
+def build_policy_payload(args, config, inference_stamp):
     with observation_window_lock:
         observation = observation_window[-1]
         image_arrs = [
@@ -138,6 +138,7 @@ def build_policy_payload(args, config):
         "right": image_arrs[2],
         "instruction": config["language_instruction"],
         "state": state,
+        "step": inference_stamp,
     }
 
 
@@ -254,7 +255,7 @@ def inference_fn_sync(args, config, policy, ros_operator):
         return None
 
     start_time = time.perf_counter()
-    actions = policy.predict_action(build_policy_payload(args, config))
+    actions = policy.predict_action(build_policy_payload(args, config, inference_stamp))
     actions = apply_fixed_arms_to_initial_pose(actions, config, target="action")
     print(f"[Sync   {inference_stamp:2d}] Model inference time: {(time.perf_counter() - start_time)*1000:.3f} ms")
     inference_stamp += 1
@@ -282,7 +283,7 @@ def inference_fn_async(args, config, policy, ros_operator, action_buffer):
                 continue
 
             start_time = time.perf_counter()
-            actions = policy.predict_action(build_policy_payload(args, config))
+            actions = policy.predict_action(build_policy_payload(args, config, inference_stamp))
             actions = apply_fixed_arms_to_initial_pose(actions, config, target="action")
             print(
                 f"[Async  {inference_stamp:2d}] Model inference time: {(time.perf_counter() - start_time)*1000:.3f} ms"
