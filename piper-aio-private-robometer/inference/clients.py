@@ -265,8 +265,8 @@ class OpenpiClient:
                 self.client.infer(_random_observation_rtc(self.image_size, self.prompt))
 
 
-class XvlaClient(OpenpiClient):
-    """X-VLA HTTP client that keeps the existing optional Robometer integration."""
+class VlaAdapterClient(OpenpiClient):
+    """VLA-Adapter-compatible HTTP client with optional Robometer integration."""
 
     def __init__(
         self,
@@ -277,7 +277,7 @@ class XvlaClient(OpenpiClient):
         dashboard_port: int | None = None,
     ) -> None:
         if chunk_size <= 0:
-            raise ValueError("X-VLA chunk_size must be positive")
+            raise ValueError("VLA-Adapter chunk_size must be positive")
 
         import json_numpy
         import requests
@@ -325,7 +325,7 @@ class XvlaClient(OpenpiClient):
     def _request_actions(self, payload, proprio) -> np.ndarray:
         proprio = np.asarray(proprio, dtype=np.float32)
         if proprio.shape != (14,) or not np.isfinite(proprio).all():
-            raise ValueError("X-VLA proprio must contain 14 finite joint values")
+            raise ValueError("VLA-Adapter proprio must contain 14 finite joint values")
 
         if self.preview is not None:
             self.preview.submit(payload["top"])
@@ -343,23 +343,23 @@ class XvlaClient(OpenpiClient):
         response.raise_for_status()
         body = response.json()
         if not isinstance(body, dict) or "action" not in body:
-            raise ValueError("X-VLA response is missing 'action'")
+            raise ValueError("VLA-Adapter response is missing 'action'")
 
         actions = np.asarray(body["action"], dtype=np.float32)
         if actions.ndim != 2 or actions.shape[1] != 14:
-            raise ValueError(f"X-VLA actions must have shape (T, 14), got {actions.shape}")
+            raise ValueError(f"VLA-Adapter actions must have shape (T, 14), got {actions.shape}")
         if actions.shape[0] < self.chunk_size:
             raise ValueError(
-                f"X-VLA action chunk length {actions.shape[0]} is smaller than {self.chunk_size}"
+                f"VLA-Adapter action chunk length {actions.shape[0]} is smaller than {self.chunk_size}"
             )
         if not np.isfinite(actions).all():
-            raise ValueError("X-VLA actions must contain only finite values")
+            raise ValueError("VLA-Adapter actions must contain only finite values")
         return actions[: self.chunk_size].copy()
 
     def predict_action(self, payload) -> np.ndarray:
         proprio = payload["state"] if self.pred_proprio is None else self.pred_proprio
         actions = self._request_actions(payload, proprio)
-        # Match the upstream X-VLA behavior: recurse from the raw model output
+        # Recurse from the raw model output before runner-side postprocessing.
         # before task-specific action postprocessing is applied by the runner.
         self.pred_proprio = actions[-1].copy()
         return actions
@@ -371,3 +371,7 @@ class XvlaClient(OpenpiClient):
         }
         payload["instruction"] = self.prompt
         self._request_actions(payload, np.zeros(14, dtype=np.float32))
+
+
+# Backward-compatible name for existing X-VLA launch commands.
+XvlaClient = VlaAdapterClient

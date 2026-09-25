@@ -12,7 +12,7 @@ import numpy as np
 import rospy
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from clients import OpenpiClient, XvlaClient
+from clients import OpenpiClient, VlaAdapterClient
 from utils import (
     InferenceDataRecorder,
     apply_fixed_arms_to_initial_pose,
@@ -391,12 +391,12 @@ def model_inference(args, config, ros_operator):
             prompt=config["language_instruction"],
             dashboard_port=args.robometer_dashboard_port if args.enable_robometer else None,
         )
-    elif args.model == "xvla":
+    elif args.model in {"xvla", "vla-adapter"}:
         if args.mode != "naive":
-            raise ValueError("X-VLA async inference currently supports only --mode naive")
+            raise ValueError("VLA-Adapter HTTP inference currently supports only --mode naive")
         if args.streaming:
-            raise ValueError("X-VLA async inference does not support --streaming")
-        policy = XvlaClient(
+            raise ValueError("VLA-Adapter HTTP inference does not support --streaming")
+        policy = VlaAdapterClient(
             host=args.host,
             port=args.port,
             prompt=config["language_instruction"],
@@ -416,7 +416,7 @@ def model_inference(args, config, ros_operator):
     ros_operator.follower_arm_publish_continuous(left0, right0)
 
     print("Warmup the server...")
-    if args.model == "xvla":
+    if args.model in {"xvla", "vla-adapter"}:
         policy.warmup()
     else:
         policy.warmup(rtc=(args.mode == "rtc"), streaming=args.streaming)
@@ -446,7 +446,7 @@ def model_inference(args, config, ros_operator):
             begin_new_episode(wait_timeout=5.0)
             reset_observation_window()
             action_buffer.reset()
-            if args.model == "xvla":
+            if args.model in {"xvla", "vla-adapter"}:
                 policy.reset()
 
             inference_stamp = 0
@@ -768,7 +768,7 @@ def get_arguments():
     parser.add_argument(
         "--model",
         type=str,
-        choices=["openpi", "xvla"],
+        choices=["openpi", "xvla", "vla-adapter"],
         help="Model to use",
         default="openpi",
         required=False,

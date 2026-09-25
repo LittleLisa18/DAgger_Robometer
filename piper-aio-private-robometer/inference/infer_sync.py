@@ -13,7 +13,7 @@ import numpy as np
 import rospy
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from clients import OpenpiClient, XvlaClient
+from clients import OpenpiClient, VlaAdapterClient
 from utils import (
     InferenceDataRecorder,
     check_keyboard_input,
@@ -185,8 +185,8 @@ def model_inference(args, config, ros_operator):
             prompt=config["language_instruction"],
             dashboard_port=args.robometer_dashboard_port if args.enable_robometer else None,
         )
-    elif args.model == "xvla":
-        policy = XvlaClient(
+    elif args.model in {"xvla", "vla-adapter"}:
+        policy = VlaAdapterClient(
             host=args.host,
             port=args.port,
             prompt=config["language_instruction"],
@@ -237,7 +237,7 @@ def model_inference(args, config, ros_operator):
             rate = rospy.Rate(args.publish_rate)
 
             reset_observation_window()
-            if args.model == "xvla":
+            if args.model in {"xvla", "vla-adapter"}:
                 policy.reset()
             action_buffer = np.zeros([chunk_size, config["state_dim"]])
             force_replan = True
@@ -553,7 +553,7 @@ def get_arguments():
     parser.add_argument(
         "--model",
         type=str,
-        choices=["openpi", "xvla"],
+        choices=["openpi", "xvla", "vla-adapter"],
         help="Model to use",
         default="openpi",
         required=False,
