@@ -265,8 +265,8 @@ class OpenpiClient:
                 self.client.infer(_random_observation_rtc(self.image_size, self.prompt))
 
 
-class VlaAdapterClient(OpenpiClient):
-    """VLA-Adapter-compatible HTTP client with optional Robometer integration."""
+class XvlaClient(OpenpiClient):
+    """X-VLA HTTP client that keeps the existing optional Robometer integration."""
 
     def __init__(
         self,
@@ -277,7 +277,7 @@ class VlaAdapterClient(OpenpiClient):
         dashboard_port: int | None = None,
     ) -> None:
         if chunk_size <= 0:
-            raise ValueError("VLA-Adapter chunk_size must be positive")
+            raise ValueError("X-VLA chunk_size must be positive")
 
         import json_numpy
         import requests
@@ -325,7 +325,7 @@ class VlaAdapterClient(OpenpiClient):
     def _request_actions(self, payload, proprio) -> np.ndarray:
         proprio = np.asarray(proprio, dtype=np.float32)
         if proprio.shape != (14,) or not np.isfinite(proprio).all():
-            raise ValueError("VLA-Adapter proprio must contain 14 finite joint values")
+            raise ValueError("X-VLA proprio must contain 14 finite joint values")
 
         if self.preview is not None:
             self.preview.submit(payload["top"])
@@ -343,23 +343,24 @@ class VlaAdapterClient(OpenpiClient):
         response.raise_for_status()
         body = response.json()
         if not isinstance(body, dict) or "action" not in body:
-            raise ValueError("VLA-Adapter response is missing 'action'")
+            raise ValueError("X-VLA response is missing 'action'")
 
         actions = np.asarray(body["action"], dtype=np.float32)
         if actions.ndim != 2 or actions.shape[1] != 14:
-            raise ValueError(f"VLA-Adapter actions must have shape (T, 14), got {actions.shape}")
+            raise ValueError(f"X-VLA actions must have shape (T, 14), got {actions.shape}")
         if actions.shape[0] < self.chunk_size:
             raise ValueError(
-                f"VLA-Adapter action chunk length {actions.shape[0]} is smaller than {self.chunk_size}"
+                f"X-VLA action chunk length {actions.shape[0]} is smaller than {self.chunk_size}"
             )
         if not np.isfinite(actions).all():
-            raise ValueError("VLA-Adapter actions must contain only finite values")
+            raise ValueError("X-VLA actions must contain only finite values")
         return actions[: self.chunk_size].copy()
 
     def predict_action(self, payload) -> np.ndarray:
         proprio = payload["state"] if self.pred_proprio is None else self.pred_proprio
         actions = self._request_actions(payload, proprio)
-        # Recurse from the raw model output before runner-side postprocessing.
+        # Match the upstream X-VLA behavior: recurse from the raw model output
+        # before task-specific action postprocessing is applied by the runner.
         # before task-specific action postprocessing is applied by the runner.
         self.pred_proprio = actions[-1].copy()
         return actions
@@ -373,5 +374,51 @@ class VlaAdapterClient(OpenpiClient):
         self._request_actions(payload, np.zeros(14, dtype=np.float32))
 
 
-# Backward-compatible name for existing X-VLA launch commands.
-XvlaClient = VlaAdapterClient
+class VlaAdapterClient(XvlaClient):
+    """VLA-Adapter AgileX HTTP client for a single right-arm policy."""
+
+    def _request_actions(self, payload, proprio) -> np.ndarray:
+        proprio = np.asarray(proprio, dtype=np.float32)
+        if proprio.shape != (14,) or not np.isfinite(proprio).all():
+            raise ValueError("VLA-Adapter proprio must contain 14 finite joint values")
+
+        if self.preview is not None:
+            self.preview.submit(payload["top"])
+
+        # The VLA-Adapter server accepts a json_numpy-encoded observation and
+        # selects the right-arm state internally when given a 14-D state.
+        query = {
+            "state": proprio,
+            "full_image": np.asarray(payload["top"], dtype=np.uint8),
+            "wrist_image": np.asarray(payload["right"], dtype=np.uint8),
+            "instruction": payload["instruction"],
+        }
+        response = self._requests.post(
+            self.url,
+            json={"encoded": self._json_numpy.dumps(query)},
+            timeout=60,
+        )
+        if not response.ok:
+            raise RuntimeError(
+                f"VLA-Adapter server returned HTTP {response.status_code}: {response.text}"
+            )
+
+        body = response.json()
+        if isinstance(body, str):
+            body = self._json_numpy.loads(body)
+        right_actions = np.asarray(body, dtype=np.float32)
+        if right_actions.ndim != 2 or right_actions.shape[1] != 7:
+            raise ValueError(
+                f"VLA-Adapter actions must have shape (T, 7), got {right_actions.shape}"
+            )
+        if right_actions.shape[0] < self.chunk_size:
+            raise ValueError(
+                "VLA-Adapter action chunk length "
+                f"{right_actions.shape[0]} is smaller than {self.chunk_size}"
+            )
+        if not np.isfinite(right_actions).all():
+            raise ValueError("VLA-Adapter actions must contain only finite values")
+
+        right_actions = right_actions[: self.chunk_size]
+        left_actions = np.broadcast_to(proprio[:7], right_actions.shape).copy()
+        return np.concatenate((left_actions, right_actions), axis=1)

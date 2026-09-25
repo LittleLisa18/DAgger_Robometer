@@ -12,7 +12,7 @@ import numpy as np
 import rospy
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from clients import OpenpiClient, VlaAdapterClient
+from clients import OpenpiClient, VlaAdapterClient, XvlaClient
 from utils import (
     InferenceDataRecorder,
     apply_fixed_arms_to_initial_pose,
@@ -393,10 +393,11 @@ def model_inference(args, config, ros_operator):
         )
     elif args.model in {"xvla", "vla-adapter"}:
         if args.mode != "naive":
-            raise ValueError("VLA-Adapter HTTP inference currently supports only --mode naive")
+            raise ValueError(f"{args.model} HTTP inference currently supports only --mode naive")
         if args.streaming:
-            raise ValueError("VLA-Adapter HTTP inference does not support --streaming")
-        policy = VlaAdapterClient(
+            raise ValueError(f"{args.model} HTTP inference does not support --streaming")
+        client_cls = XvlaClient if args.model == "xvla" else VlaAdapterClient
+        policy = client_cls(
             host=args.host,
             port=args.port,
             prompt=config["language_instruction"],

@@ -13,7 +13,7 @@ import numpy as np
 import rospy
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from clients import OpenpiClient, VlaAdapterClient
+from clients import OpenpiClient, VlaAdapterClient, XvlaClient
 from utils import (
     InferenceDataRecorder,
     check_keyboard_input,
@@ -186,7 +186,8 @@ def model_inference(args, config, ros_operator):
             dashboard_port=args.robometer_dashboard_port if args.enable_robometer else None,
         )
     elif args.model in {"xvla", "vla-adapter"}:
-        policy = VlaAdapterClient(
+        client_cls = XvlaClient if args.model == "xvla" else VlaAdapterClient
+        policy = client_cls(
             host=args.host,
             port=args.port,
             prompt=config["language_instruction"],
