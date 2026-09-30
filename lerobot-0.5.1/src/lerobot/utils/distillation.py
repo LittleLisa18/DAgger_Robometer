@@ -14,8 +14,9 @@ from lerobot.remote_inference.openpi_compat import pack_message, unpack_message
 class OpenPITeacherClient:
     """One synchronous connection per training rank; no OpenPI model dependency."""
 
-    def __init__(self, config):
+    def __init__(self, config, local_rank: int = 0):
         self.config = config
+        self.url = config.teacher_url_for_rank(local_rank)
         self.ws = None
         self.metadata = None
         self.retry_count = 0
@@ -31,7 +32,7 @@ class OpenPITeacherClient:
             try:
                 if self.ws is None:
                     self.ws = connect(
-                        self.config.teacher_url,
+                        self.url,
                         compression=None,
                         max_size=16 * 1024 * 1024,
                         open_timeout=self.config.timeout_s,

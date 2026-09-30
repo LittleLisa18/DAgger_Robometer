@@ -8,26 +8,6 @@
     "streaming": false,
     "sources": [
       {
-        "repo_id": "local/autodagger_spatial",
-        "root": "/home/ma-user/work/users/luyuxiang/code/DAgger_Robometer/datasets/autodagger_spatial",
-        "supervision": "autodagger"
-      },
-      {
-        "repo_id": "local/autodagger_object",
-        "root": "/home/ma-user/work/users/luyuxiang/code/DAgger_Robometer/datasets/autodagger_object",
-        "supervision": "autodagger"
-      },
-      {
-        "repo_id": "local/autodagger_goal",
-        "root": "/home/ma-user/work/users/luyuxiang/code/DAgger_Robometer/datasets/autodagger_goal",
-        "supervision": "autodagger"
-      },
-      {
-        "repo_id": "local/autodagger_10",
-        "root": "/home/ma-user/work/users/luyuxiang/code/DAgger_Robometer/datasets/autodagger_10",
-        "supervision": "autodagger"
-      },
-      {
         "repo_id": "lerobot/libero",
         "root": "/home/ma-user/work/dataset/lerobot/libero_lerobot30",
         "episodes": null,
@@ -53,8 +33,8 @@
     "kd_weight": 1.0,
     "bc_weight": 1.0
   },
-  "output_dir": "outputs/train/smolvla_dist_libero_ad",
-  "job_name": "smolvla_dist_libero_ad",
+  "output_dir": "outputs/smolvla_dist_libero_8gpu",
+  "job_name": "smolvla_dist_libero_8gpu",
   "resume": false,
   "seed": 7,
   "num_workers": 8,

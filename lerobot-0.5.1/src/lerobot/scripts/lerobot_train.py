@@ -430,7 +430,13 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
         from lerobot.utils.distillation import OpenPITeacherClient
 
-        teacher_client = OpenPITeacherClient(cfg.distillation)
+        teacher_client = OpenPITeacherClient(cfg.distillation, local_rank=accelerator.local_process_index)
+        logging.info(
+            "Teacher local_rank=%s device=%s url=%s",
+            accelerator.local_process_index,
+            device,
+            teacher_client.url,
+        )
         atexit.register(teacher_client.close)
 
     train_metrics = {

@@ -29,6 +29,19 @@ def _model_features(features):
             if len(shape) == 3 and len(names) == 3 and names[2] in ("channel", "channels"):
                 shape = (shape[2], shape[0], shape[1])
             result[key] = {"shape": shape, "dtype": "visual"}
+        elif key in ("observation.state", "action"):
+            # Generic vector labels are not component names. Preserve explicit component order.
+            normalized = dict(feature)
+            normalized["shape"] = tuple(feature.get("shape", ()))
+            names = feature.get("names")
+            generic_names = ("state", "states") if key == "observation.state" else ("action", "actions")
+            if names is None or names == [] or names in ([name] for name in generic_names):
+                normalized["names"] = None
+            if "fps" in normalized:
+                if normalized["fps"] != 10:
+                    raise ValueError(f"{key} feature FPS must match the 10 FPS LIBERO dataset")
+                normalized.pop("fps")
+            result[key] = normalized
         else:
             result[key] = feature
     return result
@@ -213,12 +226,21 @@ class MultiAutoDAggerDistillationDataset(Dataset):
         self.datasets = datasets
         first = datasets[0]
 
-        for source in datasets[1:]:
+        for source_index, source in enumerate(datasets[1:], start=1):
             if (
                 _model_features(source.meta.features) != _model_features(first.meta.features)
                 or source.meta.fps != first.meta.fps
             ):
-                raise ValueError("AutoDAgger sources must have matching feature schemas and FPS")
+                reference = _model_features(first.meta.features)
+                current = _model_features(source.meta.features)
+                differences = sorted(
+                    key for key in reference.keys() | current.keys() if reference.get(key) != current.get(key)
+                )
+                raise ValueError(
+                    "AutoDAgger sources must have matching feature schemas and FPS; "
+                    f"source {source_index} ({source.root}) vs source 0 ({first.root}): "
+                    f"different features={differences}, FPS={source.meta.fps} vs {first.meta.fps}"
+                )
             if source.chunk_size != first.chunk_size:
                 raise ValueError("AutoDAgger sources must use the same student chunk_size")
         self.cumulative_sizes = np.cumsum([len(source) for source in datasets]).tolist()

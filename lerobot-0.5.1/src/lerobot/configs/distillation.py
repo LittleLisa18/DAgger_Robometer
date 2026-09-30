@@ -14,8 +14,23 @@ class DistillationConfig:
     bc_weight: float = 1.0
     # Populated on first run and checked against the dataset when resuming.
     dataset_fingerprint: str | None = None
+    # Ordered by LOCAL_RANK; None keeps the existing shared teacher_url behavior.
+    teacher_urls: list[str] | None = None
+
+    def teacher_url_for_rank(self, local_rank: int) -> str:
+        if self.teacher_urls is None:
+            return self.teacher_url
+        if not 0 <= local_rank < len(self.teacher_urls):
+            raise ValueError(f"No teacher URL configured for local rank {local_rank}")
+        return self.teacher_urls[local_rank]
 
     def validate(self, cfg) -> None:
+        if self.teacher_urls is not None and (
+            not self.teacher_urls
+            or any(not url.startswith(("ws://", "wss://")) for url in self.teacher_urls)
+            or len(set(self.teacher_urls)) != len(self.teacher_urls)
+        ):
+            raise ValueError("teacher_urls must contain distinct WebSocket URLs in local-rank order")
         if not self.teacher_url.startswith(("ws://", "wss://")) or not self.teacher_id.strip():
             raise ValueError("Distillation requires a WebSocket teacher_url and nonempty teacher_id")
         if not math.isfinite(self.timeout_s) or self.timeout_s <= 0 or self.retries < 0:

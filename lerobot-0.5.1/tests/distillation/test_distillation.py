@@ -133,6 +133,44 @@ class DatasetTests(unittest.TestCase):
 
 
 class ClientTests(unittest.TestCase):
+    def test_local_rank_routes_to_distinct_servers(self):
+        def handler(value):
+            def respond(ws):
+                ws.send(pack_message({}))
+                ws.recv()
+                ws.send(pack_message({"actions": np.full((10, 7), value, dtype=np.float32)}))
+
+            return respond
+
+        with serve(handler(0.1), "127.0.0.1", 0) as first, serve(handler(0.9), "127.0.0.1", 0) as second:
+            threads = [
+                threading.Thread(target=server.serve_forever, daemon=True) for server in (first, second)
+            ]
+            for thread in threads:
+                thread.start()
+            config = DistillationConfig(
+                "ws://unused",
+                "test",
+                teacher_urls=[
+                    f"ws://127.0.0.1:{first.socket.getsockname()[1]}",
+                    f"ws://127.0.0.1:{second.socket.getsockname()[1]}",
+                ],
+            )
+            try:
+                for rank, value in enumerate((0.1, 0.9)):
+                    client = OpenPITeacherClient(config, local_rank=rank)
+                    try:
+                        np.testing.assert_allclose(client.infer(teacher_observation(raw_batch(), 0)), value)
+                    finally:
+                        client.close()
+                with self.assertRaisesRegex(ValueError, "local rank"):
+                    OpenPITeacherClient(config, local_rank=2)
+            finally:
+                first.shutdown()
+                second.shutdown()
+                for thread in threads:
+                    thread.join(timeout=5)
+
     def with_server(self, handler, check):
         with serve(handler, "127.0.0.1", 0) as server:
             thread = threading.Thread(target=server.serve_forever, daemon=True)

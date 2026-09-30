@@ -91,6 +91,98 @@ step 10 到 step 11 仍有非零更新；保存的 training_step 分别为 10/11
 - `multi_outputs/{single,dual}/checkpoints/{000010,000011}` 及各自 `distillation_metrics.jsonl`
 - `multi_data_verification.json`、`multi_training_verification.json`、`multi_resume_reordered.log`
 
+## 无 collect 示教数据混训验证（2026-09-18）
+
+新增来源参数 `supervision="demonstration"`，默认仍为 `autodagger`。
+使用同一个 hw 隔离源码目录，在 `/dev/shm/codex-smolvla-demo-20260918` 创建测试数据和输出。
+普通示教测试源由之前的小型 LeRobot 导出复制后移除 collect 列、对应 feature 和 AutoDAgger 审计文件构造，
+仅用于验证加载与监督机制，并非新的人类示教数据或策略效果实验。原数据不变。
+
+- 22 项回归测试全部通过，新增覆盖无 collect/无审计加载、两种来源排列下的 batch 拼接、
+  普通示教 BC、episode/数据集边界、padding、错误监督模式及禁止覆盖已有 collect。
+- 实际混合读取 239 帧 AutoDAgger episode 和 223 帧无标签示教测试 episode，共 462 帧。
+- 显式构造一个 rollout 样本和一个示教样本的 batch：两者均参与 KD；
+  rollout 的 BC mask 全零，示教的 10 步 BC mask 全真。BC 标签与原始数据动作的归一化结果一致，
+  KD 标签与模拟 teacher 动作的归一化结果一致；检查梯度仅流向允许的 BC 样本。
+- 本次 hw 原 teacher 8000 端口拒绝连接，因此短训练使用独立临时 WebSocket 模拟服务，
+  返回固定的有限 `[10,7]` 动作，checkpoint 的 teacher_id 为 `MOCK_VALIDATION_ONLY`。
+  测试完成会关闭该服务。本轮不能作为真实 OpenPI teacher 或策略质量验证。
+- 3 个本次修改的源码/测试文件与 hw 验证副本的 SHA-256 一致（归一化换行）；Ruff 及 diff 检查通过。
+- 使用真实 SmolVLA base 权重、tokenizer 和 processors，单卡与双卡均完成 3 步训练、保存，
+  再恢复到第 4 步并保存。每 rank batch_size=2，DataLoader workers=2，双卡使用 bf16。
+  恢复后的 action_out_proj.weight 最大更新分别为 2.4885e-6/2.4997e-6，processor 统计数值均不变。
+  单卡 4 次更新中 BC 非零 3 次，双卡 4 次均非零，训练 loss 均有限。
+
+本次日志位于 `/tmp/codex-smolvla-distill-01a08b28` 的 `demo_unit.log`、`demo_prepare.log`、
+`demo_mock_verify.log`、`demo_{single,dual}_{train,resume}.log`，汇总为 `demo_verification.json`。
+checkpoint 位于上述共享内存目录的 `{single,dual}/checkpoints`，为临时测试产物。
+
+## hw 原训练配置的 HWC 元信息兼容修复（2026-09-18）
+
+用户实际配置为服务器正式仓库的 `configs/distill_smolvla.json`，数据目录为
+`/home/ma-user/work/dataset/lerobot/libero_lerobot30`，273,465 帧、1,693 个 episode。
+视频元信息使用 `[256,256,3]` 及 `height/width/channel`，torchcodec 实际解码输出 `[3,256,256]`。
+旧校验错误地要求元信息本身为 CHW；数据同时没有 collect，而正式仓库尚未更新 demonstration 模式。
+
+修复按 LeRobot 的轴名称规则校验解码后的形状，支持 CHW/HWC 两种元信息，兼容多来源混合。
+在确认服务器两个源码文件与本地旧版完全一致后，备份并更新 `configs/default.py` 和
+`datasets/autodagger_distillation.py`；将服务器训练配置改为单项 sources，显式声明 demonstration。
+其余训练参数保留，数据集文件未改写。
+
+- 23 项蒸馏回归测试通过，包含 HWC/CHW 来源混合、无标签示教、禁止错误分辨率和不修改元信息。
+- 在隔离代码和更新后的正式源码中，分别通过完整数据集索引、episode 边界和文件内容指纹校验。
+- 抽查图像张量 `[3,256,256]`，teacher 输入图像 `[256,256,3]`；首帧有效 BC 10 步，最终帧仅 1 步。
+- 数据文件指纹两次一致，`info.json` 的 SHA-256 不变。
+- 本轮没有启动长训练或真实 teacher；复核时 8000 端口未监听。
+
+原源码及配置备份：`/tmp/codex-smolvla-distill-01a08b28/backups/hwc-production-20260918-203126`。
+同一隔离目录下保存 `hwc_unit.log`、`hwc_preflight.json`、`hwc_install.json`、`hwc_production_verified.json`。
+
+## 两张卡各自运行真实 OpenPI teacher（2026-09-18）
+
+在隔离目录验证新的 `train_distill_smolvla.sh`，随后备份并安装到服务器正式仓库。
+使用真实 `pi05_libero_bl/29999` 权重，以及用户配置的数据集（273,465 帧普通示教）。
+测试设置为每 rank batch_size=1、2 步、不保存 checkpoint；没有启动用户的 100,000 步训练。
+
+- 24 项蒸馏测试通过，新增双 WebSocket 服务的 rank 路由测试；脚本语法及修改源码 Ruff 检查通过。
+- 特意使用 `CUDA_VISIBLE_DEVICES=1,0`，验证 rank 0 对应物理 GPU 1 / 18700，rank 1 对应 GPU 0 / 18701。
+  读取 teacher 进程环境确认卡号，两个真实服务均收到训练连接。
+- 两步 KD/BC 均有限，分别为 2.539512/2.670636 和 5.805365/2.751995；teacher 重试均为 0。
+- 首步 teacher 请求约 30.37 秒（包含编译），第二步约 0.21 秒；这不是正式 batch_size=32 的性能测量。
+- 训练退出后本次 teacher 进程全部消失、18700/18701 端口释放；原有 8000 服务仍保持监听。
+- 占用端口测试确认脚本在加载模型前失败。OpenPI 进程清除 student 的 PYTHONPATH 后，旧版 lerobot.common 依赖正常加载。
+
+证据保存在 `/tmp/codex-smolvla-distill-01a08b28`：`dual_teacher_unit.log`、
+`dual_teacher_launch_retry.log`、`dual_teacher_processes.json`、`dual_teacher_verified.json`。
+服务日志为 `dual_teacher_logs/run-YD7oDLSa/teacher_rank{0,1}.log`。
+正式目录安装的启动脚本及三个 Python 文件均校验哈希一致，旧文件备份于
+`backups/dual-teacher-production-20260918-210620`，安装清单为 `dual_teacher_install_report.json`。
+
+## 启动脚本精简（2026-09-19）
+
+按用户要求将 Bash 精简为 78 行，直接启动两个 teacher，再用 curl 查询 OpenPI 原生 `/healthz`，
+最后启动 Accelerate。保留端口检查、超时、teacher 退出检测和本次进程组清理。
+
+精简过程中完成真实双 teacher / 双卡两步训练；最终 healthz 版本另完成一次单步双卡训练，
+使用 GPU 顺序 `1,0`，每 rank batch_size=1。最终 KD=2.541899、BC=2.670636，teacher 重试为 0。
+脚本退出状态为 0，测试端口 18700–18703 全部释放，已有 8000 服务仍在运行。
+本轮没有启动正式长训练，未验证正式 batch_size=32 的显存余量。
+
+正式脚本已经替换并校验哈希。旧版备份位于
+`/tmp/codex-smolvla-distill-01a08b28/backups/simple-launcher-20260919-162802`。
+同一隔离根目录保存 `simple_teacher_train.log`、`simple_healthz_train.log` 和 `simple_launcher_verified.json`。
+
+## 可直接编辑、可变卡数的新脚本（2026-09-19）
+
+新增 `train_distill_smolvla_simple.sh`，在 Bash 顶部直接修改 GPU 列表、起始端口、训练 JSON 和 teacher 路径。
+无命令行参数或环境变量覆盖入口。GPU 数量由列表长度计算，每张 GPU 启动一个 teacher，端口依次递增。
+旧启动脚本保留。新脚本已安装到 hw 正式目录，本地与服务器 SHA-256 一致。
+
+真实单卡（GPU 1）与双卡（GPU 顺序 1,0）各完成一步训练，每 rank batch_size=1，退出状态均为 0。
+单卡 KD/BC 为 4.717989/5.347788，双卡为 2.539018/2.670636，teacher 重试均为 0。
+测试端口 18710、18712、18713 均释放。四卡只验证了地址生成，未进行四卡硬件训练。
+日志位于 `/tmp/codex-smolvla-distill-01a08b28/configurable_{one,two}/train.log`。
+
 ## 结论边界
 
 已验证真实 teacher 下的训练、分布式归约、保存恢复和 checkpoint 推理链路。

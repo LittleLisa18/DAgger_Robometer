@@ -84,6 +84,44 @@ class NumericDataset(FakeDataset):
 
 
 class MultiDatasetTests(unittest.TestCase):
+    def test_generic_vector_metadata_compatibility(self):
+        with tempfile.TemporaryDirectory() as temp:
+            auto = NumericDataset(Path(temp) / "auto", 0)
+            demo = self.demonstration(Path(temp) / "demo")
+            for key, label in (("observation.state", "state"), ("action", "actions")):
+                auto.meta.features[key]["names"] = None
+                demo.meta.features[key].update(names=[label], fps=10.0)
+            original = json.loads(json.dumps(demo.meta.features))
+            sources = [
+                AutoDAggerDistillationDataset(auto, 3),
+                AutoDAggerDistillationDataset(demo, 3, "demonstration"),
+            ]
+            for ordered in (sources, sources[::-1]):
+                ds = MultiAutoDAggerDistillationDataset(ordered)
+                self.assertEqual(len(ds), 14)
+            self.assertEqual(demo.meta.features, original)
+            for key in ("observation.state", "action"):
+                demo.meta.features[key]["fps"] = 20
+                with self.assertRaisesRegex(ValueError, "feature FPS"):
+                    MultiAutoDAggerDistillationDataset(sources)
+                demo.meta.features[key]["fps"] = 10.0
+            demo.meta.features["action"]["dtype"] = "float64"
+            with self.assertRaisesRegex(ValueError, "different features=.*action"):
+                MultiAutoDAggerDistillationDataset(sources)
+
+    def test_explicit_component_order_is_preserved(self):
+        with tempfile.TemporaryDirectory() as temp:
+            first = NumericDataset(Path(temp) / "first", 0)
+            second = NumericDataset(Path(temp) / "second", 0)
+            sources = [AutoDAggerDistillationDataset(raw, 3) for raw in (first, second)]
+            MultiAutoDAggerDistillationDataset(sources)
+            second.meta.features["action"]["names"].reverse()
+            with self.assertRaisesRegex(ValueError, "different features=.*action"):
+                MultiAutoDAggerDistillationDataset(sources)
+            second.meta.features["action"]["names"] = None
+            with self.assertRaisesRegex(ValueError, "different features=.*action"):
+                MultiAutoDAggerDistillationDataset(sources)
+
     def test_legacy_hwc_metadata_and_mixed_layouts(self):
         with tempfile.TemporaryDirectory() as temp:
             chw = NumericDataset(Path(temp) / "chw", 0)
