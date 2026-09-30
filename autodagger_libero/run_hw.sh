@@ -6,6 +6,8 @@ STUDENT_PYTHON="${STUDENT_PYTHON:-$PACKAGE_ROOT/lerobot-0.5.1/.venv/bin/python}"
 COLLECTOR_PYTHON="${COLLECTOR_PYTHON:-/home/ma-user/work/users/luyuxiang/envs/libero/bin/python}"
 ROBOMETER_PYTHON="${ROBOMETER_PYTHON:-$PACKAGE_ROOT/robometer/.venv/bin/python}"
 ROBOMETER_MODEL="${ROBOMETER_MODEL:-/home/ma-user/work/model/robometer-4b-fft-libero}"
+
+export HF_HOME="/home/ma-user/work/hf"
 export STUDENT_PYTHON COLLECTOR_PYTHON ROBOMETER_PYTHON
 export PYTHONPATH="$PACKAGE_ROOT:$CODE_ROOT/better_openpi/packages/openpi-client/src${PYTHONPATH:+:$PYTHONPATH}"
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
@@ -13,9 +15,11 @@ export XLA_PYTHON_CLIENT_PREALLOCATE=false
 MODE="${1:-help}"
 if [[ $# -gt 0 ]]; then shift; fi
 case "$MODE" in
+ evaluate)
+  exec "$COLLECTOR_PYTHON" -m autodagger_libero.evaluate_success "$@" ;;
  student)
   export PYTHONPATH="$PACKAGE_ROOT/lerobot-0.5.1/src:$PYTHONPATH"
-  export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
+  # export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
   exec "$STUDENT_PYTHON" -m autodagger_libero.serve_student "$@" ;;
  robometer)
   "$COLLECTOR_PYTHON" -m autodagger_libero.check_robometer_files \
@@ -45,5 +49,5 @@ case "$MODE" in
   export PYTHONPATH="$PACKAGE_ROOT/lerobot-0.5.1/src:$PYTHONPATH"
   TEST_MODULE="${MODE//-/_}"
   exec "$STUDENT_PYTHON" -m "autodagger_libero.tests.$TEST_MODULE" "$@" ;;
- *) echo 'Usage: bash autodagger_libero/run_hw.sh {student|robometer|collect|export|view|test|check-export|check-student|check-browser|check-services} [args]' ;;
+ *) echo 'Usage: bash autodagger_libero/run_hw.sh {evaluate|student|robometer|collect|export|view|test|check-export|check-student|check-browser|check-services} [args]' ;;
 esac

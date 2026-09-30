@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import tempfile
 import numpy as np
+from tqdm import tqdm
 
 
 def export(root, output, repo_id, fps=10):
@@ -27,15 +28,11 @@ def export(root, output, repo_id, fps=10):
         ):
             episodes.append((path, meta))
     if not episodes:
-        raise ValueError(
-            "No non-test episodes with teacher takeover and passing final score"
-        )
+        raise ValueError("No non-test episodes with teacher takeover and passing final score")
     output.parent.mkdir(parents=True, exist_ok=True)
     # Publish only after finalize() and audit sidecars succeed. A failed export
     # leaves the destination free for a clean retry, with raw episodes untouched.
-    with tempfile.TemporaryDirectory(
-        prefix=".autodagger-export-", dir=output.parent
-    ) as temp:
+    with tempfile.TemporaryDirectory(prefix=".autodagger-export-", dir=output.parent) as temp:
         staging = Path(temp) / "dataset"
         mapping = _export(root, staging, repo_id, fps, episodes)
         staging.rename(output)
@@ -47,14 +44,36 @@ def _export(root, output, repo_id, fps, episodes):
 
     features = {
         "observation.images.image": {
-            "dtype": "image",
-            "shape": (3, 256, 256),
-            "names": ["channels", "height", "width"],
+            "dtype": "video",
+            "shape": [256, 256, 3],
+            "names": ["height", "width", "channel"],
+            "fps": 10.0,
+            "info": {
+                "video.height": 256,
+                "video.width": 256,
+                "video.codec": "av1",
+                "video.pix_fmt": "yuv420p",
+                "video.is_depth_map": False,
+                "video.fps": 10,
+                "video.channels": 3,
+                "has_audio": False,
+            },
         },
         "observation.images.image2": {
-            "dtype": "image",
-            "shape": (3, 256, 256),
-            "names": ["channels", "height", "width"],
+            "dtype": "video",
+            "shape": [256, 256, 3],
+            "names": ["height", "width", "channel"],
+            "fps": 10.0,
+            "info": {
+                "video.height": 256,
+                "video.width": 256,
+                "video.codec": "av1",
+                "video.pix_fmt": "yuv420p",
+                "video.is_depth_map": False,
+                "video.fps": 10,
+                "video.channels": 3,
+                "has_audio": False,
+            },
         },
         "observation.state": {"dtype": "float32", "shape": (8,), "names": None},
         "action": {"dtype": "float32", "shape": (7,), "names": None},
@@ -66,19 +85,16 @@ def _export(root, output, repo_id, fps, episodes):
         fps=fps,
         features=features,
         robot_type="panda",
-        use_videos=False,
+        image_writer_processes=24,
+        image_writer_threads=12,
+        video_backend="torchcodec",
     )
     mapping = []
     try:
-        for metadata, meta in episodes:
+        for metadata, meta in tqdm(episodes, desc="Exporting episodes"):
             index = sum(e["dataset_episode_index"] is not None for e in mapping)
-            with np.load(
-                metadata.parent / "trajectory.npz", allow_pickle=False
-            ) as trajectory:
-                if any(
-                    len(trajectory[k]) != meta["steps"]
-                    for k in ("image", "image2", "state", "action", "collect")
-                ):
+            with np.load(metadata.parent / "trajectory.npz", allow_pickle=False) as trajectory:
+                if any(len(trajectory[k]) != meta["steps"] for k in ("image", "image2", "state", "action", "collect")):
                     raise ValueError(f"Frame count mismatch: {metadata}")
                 if not np.isin(trajectory["collect"], ["rollout", "teacher"]).all():
                     raise ValueError(f"Invalid collect labels: {metadata}")
@@ -97,12 +113,8 @@ def _export(root, output, repo_id, fps, episodes):
             mapping.append({"dataset_episode_index": index, **meta})
     finally:
         dataset.finalize()
-    (output / "meta" / "autodagger_episodes.json").write_text(
-        json.dumps(mapping, indent=2)
-    )
-    (output / "meta" / "autodagger_run.json").write_text(
-        (root / "run.json").read_text()
-    )
+    (output / "meta" / "autodagger_episodes.json").write_text(json.dumps(mapping, indent=2))
+    (output / "meta" / "autodagger_run.json").write_text((root / "run.json").read_text())
     return mapping
 
 
@@ -113,9 +125,7 @@ def selected_frames(root, include_rollout=False, accepted_only=True):
     """
     for path in sorted(Path(root).glob("*/metadata.json")):
         meta = json.loads(path.read_text())
-        if meta.get("test_only") or (
-            accepted_only and not meta["accepted_for_distillation"]
-        ):
+        if meta.get("test_only") or (accepted_only and not meta["accepted_for_distillation"]):
             continue
         if not meta["steps"]:
             continue

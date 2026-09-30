@@ -1,0 +1,48 @@
+{
+  "output": "/home/ma-user/work/users/luyuxiang/code/DAgger_Robometer/runs/robometer_eval_object_steps280",
+  "suite": "libero_object",
+  "task_ids": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9
+  ],
+  "episodes": 20,
+  "initial_state_start": 0,
+  "seed": 7,
+  "control_freq": 20,
+  "max_steps": 280,
+  "settling_steps": 10,
+  "actions_per_chunk": 5,
+  "max_frames": 8,
+  "tail_offsets": [
+    20,
+    15,
+    10,
+    5,
+    0
+  ],
+  "success_threshold": 0.5,
+  "timeout": 60,
+  "retries": 1,
+  "startup_timeout": 600,
+  "test_only": false,
+  "gpu": "0",
+  "student_checkpoint": "/home/ma-user/work/model/smolvla_libero",
+  "student_port": 8120,
+  "score_port": 8122,
+  "score_models": {
+    "original": "/home/ma-user/work/model/Robometer-4B",
+    "finetuned": "/home/ma-user/work/model/robometer-4b-fft-libero"
+  },
+  "student_python": "/home/ma-user/work/users/luyuxiang/code/DAgger_Robometer/lerobot-0.5.1/.venv/bin/python",
+  "robometer_python": "/home/ma-user/work/users/luyuxiang/code/DAgger_Robometer/robometer/.venv/bin/python",
+  "libero_root": "/home/ma-user/work/users/luyuxiang/code/LIBERO",
+  "hf_home": "/home/ma-user/work/hf"
+}

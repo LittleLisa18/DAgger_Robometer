@@ -242,3 +242,61 @@ Black 在 hw 的独立 uv 工具环境中执行：
 ```
 
 添加 `--check` 仅检查、不改写。运行这些命令不需要恢复已删除的 `.runtime` 目录。
+
+## 独立验证 Robometer 的成功判定
+
+`evaluate_success.py` 实现纯 student 实验：不连接 teacher，评分不参与动作选择、停止条件或样本筛选。全部模型、仿真和测试在 hw 运行。
+
+每个正式套件固定全部 10 个任务、每任务初始状态 0–19，共 200 条；seed 7、20 Hz、每次执行 5 个动作，初始化静置 10 步另计。策略动作预算如下，参数均在 JSON 中指定：
+
+| 套件 | 采集配置 | 最大动作步数 | Student / 评分端口 | 输出目录（runs 下） |
+|---|---|---:|---|---|
+| Spatial | evaluation.json | 220 | 8110 / 8112 | robometer_eval_spatial_steps220 |
+| Object | evaluation_object.json | 280 | 8120 / 8122 | robometer_eval_object_steps280 |
+| Goal | evaluation_goal.json | 300 | 8130 / 8132 | robometer_eval_goal_steps300 |
+| LIBERO-10 | evaluation_10.json | 520 | 8140 / 8142 | robometer_eval_10_steps520 |
+
+旧的 440 步实验目录保留，不与这些新预算结果混合。不同预算会影响真实成功率，比较时必须同时注明 suite 与预算。
+
+### 采集与评分流水线
+
+`pipeline_*.json` 指向采集配置，并指定 `score_gpu` 和 `poll_seconds`。当前 student 均使用 GPU 0，评分使用 GPU 1，每 5 秒扫描一次已提交轨迹。hw 的 EGL 仅暴露一个设备，仿真使用默认渲染设备。
+
+```bash
+# 两条独立烟测，不计入正式统计
+bash autodagger_libero/run_hw.sh evaluate pipeline --config autodagger_libero/pipeline_spatial_smoke.json
+
+# 四个套件可在独立终端并行运行
+bash autodagger_libero/run_hw.sh evaluate pipeline --config autodagger_libero/pipeline_spatial.json
+bash autodagger_libero/run_hw.sh evaluate pipeline --config autodagger_libero/pipeline_object.json
+bash autodagger_libero/run_hw.sh evaluate pipeline --config autodagger_libero/pipeline_goal.json
+bash autodagger_libero/run_hw.sh evaluate pipeline --config autodagger_libero/pipeline_10.json
+```
+
+采集进程独占环境和 student 服务；原版 Robometer 在另一个 GPU 上读取已原子提交的完整 episode。采集结束并处理完原版评分后，停止原版服务、加载微调版，对同一批轨迹评分。每个实验内两个评分模型仍顺序加载。不同实验使用独立端口、目录及运行锁，只关闭自身启动的子进程。
+
+`pipeline_status.json` 记录当前阶段；`original_attempted` 是已尝试评分的轨迹数，不等于成功覆盖数。最终以 `report/coverage.json` 和 `report/metrics.json` 的完整性为准。服务错误不会变成低分或失败标签；重试仍失败时保留记录，报告明确不完整。
+
+也可使用串行入口，`all` 可换成 `rollout`、`score` 或 `report`：
+
+```bash
+bash autodagger_libero/run_hw.sh evaluate all --config autodagger_libero/evaluation.json
+```
+
+不要对同一输出目录同时启动多个入口。重复运行相同入口会跳过已完成 episode 和同身份评分，中断采集尝试保留在独立 `attempt_*` 目录。流水线恢复时沿用同一份 pipeline JSON；修改实验配置需要新输出目录。
+
+### 轨迹、评分和报告
+
+`trajectory.npz` 保存动作前双相机、state、实际动作和原始策略动作，所有帧标记为 `collect="rollout"`。`terminal.npz` 额外保存最后动作后的观测和步号，T 个动作对应 0…T 共 T+1 个可评分观测。
+
+主评分从已旋转一次的 agent-view 中均匀采样最多 8 帧，包含初始帧和终止帧，采用 `success_probs[-1] > 0.5`。末段另评估 T−20、T−15、T−10、T−5 的前缀，负数截为 0 并去重；不改变主判定。两模型输入哈希必须一致，环境标签不会传给评分模型。
+
+完整响应、采样步号、输入哈希、检查点内容哈希和协议保存在 `scores`；进程日志和显存快照在 `services`。每次策略请求的噪声种子由 seed、episode ID、动作步生成，使重试及恢复不依赖此前处理了多少 episode。
+
+`report/report.md`、`episodes.csv`、`tasks.csv`、`metrics.json`、`coverage.json` 和 PNG 提供全量、共同样本集、逐任务及宏平均指标。PR-AUC 为按并列分数分组的梯形积分，另报 average precision；缺少正负类别的 AUC 不计算。末段规则仅供诊断，不用于本批调参；保留自然成败比例，不人为凑失败样本。
+
+独立模块测试在 hw 执行：
+
+```bash
+/home/ma-user/work/users/luyuxiang/envs/libero/bin/python -m unittest autodagger_libero.tests.test_evaluation -v
+```

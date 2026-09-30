@@ -1,0 +1,5 @@
+{
+  "poll_seconds": 5,
+  "score_gpu": "1",
+  "evaluation_config": "evaluation.json"
+}
