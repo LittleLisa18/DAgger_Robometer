@@ -349,7 +349,7 @@ class LiveState:
             "source_elapsed": submitted - self.started_at,
             "progress": clipped_progress,
             "success_probability": clipped_success,
-            "success": int(success >= self.settings.success_threshold),
+            "success": int(success > self.settings.success_threshold),
             "latency_ms": round(latency * 1000, 1), "episode": request_episode,
             "task": self.task, "progress_trace": progress_trace, "success_trace": success_trace,
         }
